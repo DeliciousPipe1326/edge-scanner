@@ -2,7 +2,9 @@
 
 **Arbitrage • Middles • +EV**
 
-Open-source sports betting scanner that finds arbitrage opportunities, middle bets, and +EV plays across US, UK, EU, and Australian bookmakers returned by The Odds API.
+Edge Scanner is a **free, open-source sports betting scanner** you can run locally, use as-is, or adapt to your own needs under the MIT license. It scans for arbitrage candidates, middles, and +EV estimates across US, UK, EU, and Australian bookmakers. There is no Edge Scanner subscription.
+
+**You need your own [The Odds API](https://the-odds-api.com/) key.** Scans consume credits from your API account and are subject to the provider's credit limits, rate limits, and plan terms. The scanner does not include an API key or an odds-data allowance; any data-provider charges are separate from this free software.
 
 ## Features
 
@@ -35,7 +37,7 @@ python app.py
 
 1. Clone this repo and create the environment above
 2. Install the pinned dependencies above
-3. Get a free API key from [The Odds API](https://the-odds-api.com/)
+3. Get your own API key from [The Odds API](https://the-odds-api.com/) and check the credit allowance and limits for your plan
 4. Run: `python app.py`
 
 Your browser opens automatically. Enter your API key, choose your settings, and select **Scan Now**. Review the maximum credit cost, then confirm **Run scan**. Canceling the preview makes no paid odds requests. **Download JSON** saves the complete timestamped response without the API key.
@@ -63,13 +65,15 @@ Arbitrage and +EV spread/total calculations support **half-point lines only**. W
 
 ## API Usage
 
+All odds-data usage is charged against **your own API account's credit allowance**, not an allowance provided by Edge Scanner. Your selected API plan determines the available credits and any associated cost.
+
 Each scan makes one sports-list request (quota-free) and one odds request per active selected sport. **Requests and credits differ:** odds quota cost is markets × regions. A three-market US/EU request can cost six credits. The scanner also includes the selected sharp reference's region (normally EU), even if you did not select it.
 
 Before each scan, the quota-free `/plan` request lists active selected sports, effective regions, estimated maximum credits, and the account's remaining credits. `/scan` checks that bound again before making paid requests. Concurrent scans are rejected; authentication failures, rate limiting, and depleted quota stop further requests.
 
 The UI reports actual scan credits, remaining credits, and odds request count separately using `x-requests-last`, `x-requests-used`, and `x-requests-remaining`. Missing headers or interrupted requests produce **unknown** usage rather than an invented zero. See [The Odds API quota documentation](https://the-odds-api.com/liveapi/guides/v4/#usage-quota-costs-1).
 
-API clients must provide `maxCredits` in `/scan` JSON (the default budget is zero). Optional fields include `maxQuoteAge` (15–900 seconds, default 120) `windowHours` (`24`, `48`, `168`, or `null` for Infinite), and `bookmakers` (a list of result-filter keys). Regions still determine quota cost; bookmaker filters do not reduce requests.
+API clients must provide `maxCredits` in `/scan` JSON (the default budget is zero). Optional fields include `maxQuoteAge` (15–900 seconds, default 120), `windowHours` (`24`, `48`, `168`, or `null` for Infinite), and `bookmakers` (a list of result-filter keys). Regions still determine quota cost; bookmaker filters do not reduce requests.
 
 ## Quote and reference quality
 
