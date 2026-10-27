@@ -48,7 +48,15 @@ class ScannerError(Exception):
 
 
 def _iso_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _valid_price(value) -> Optional[float]:
+    try:
+        price = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if math.isfinite(price) and price > 1 else None
 
 
 def _clamp_commission(rate: float) -> float:
@@ -108,7 +116,7 @@ def _points_match(point_a, point_b, tolerance: float = 1e-6) -> bool:
         return False
     try:
         return abs(float(point_a) - float(point_b)) <= tolerance
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
 
 
@@ -165,15 +173,15 @@ def _build_sharp_reference(
         if market_key not in ALLOWED_PLUS_EV_MARKETS:
             continue
         for outcome in market.get("outcomes", []):
-            price = outcome.get("price")
-            if not price or price <= 1:
+            price = _valid_price(outcome.get("price"))
+            if price is None:
                 continue
             line_key = _line_key(market_key, outcome)
             if not line_key:
                 continue
             try:
                 price_val = float(price)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             adjusted_price = _apply_commission(price_val, commission_rate, is_exchange)
             line_map.setdefault((market_key, line_key), []).append(
@@ -226,15 +234,15 @@ def _two_way_outcomes(bookmaker: dict) -> Dict[Tuple[str, str], List[dict]]:
         if market_key not in ALLOWED_PLUS_EV_MARKETS:
             continue
         for outcome in market.get("outcomes", []):
-            price = outcome.get("price")
-            if not price or price <= 1:
+            price = _valid_price(outcome.get("price"))
+            if price is None:
                 continue
             line_key = _line_key(market_key, outcome)
             if not line_key:
                 continue
             try:
                 display_price = float(price)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             line_map.setdefault((market_key, line_key), []).append(
                 {
@@ -255,7 +263,7 @@ def _estimate_middle_probability(
     lookup_key = f"{sport_key}_{market_key}"
     base_prob = PROBABILITY_PER_INTEGER.get(lookup_key, PROBABILITY_PER_INTEGER["default"])
     total = 0.0
-    is_key_sport = sport_key in KEY_NUMBER_SPORTS
+    is_key_sport = sport_key in KEY_NUMBER_SPORTS and market_key == "spreads"
     for integer in middle_integers:
         abs_int = abs(integer)
         if is_key_sport and abs_int in NFL_KEY_NUMBER_PROBABILITY:
@@ -268,12 +276,8 @@ def _estimate_middle_probability(
 def _calculate_middle_stakes(odds_a: float, odds_b: float, total_stake: float) -> Tuple[float, float]:
     if total_stake <= 0 or odds_a <= 1 or odds_b <= 1:
         return 0.0, 0.0
-    profit_a = odds_a - 1
-    profit_b = odds_b - 1
-    denominator = profit_a + profit_b
-    if denominator <= 0:
-        return 0.0, 0.0
-    stake_a = total_stake * profit_b / denominator
+    # Equalize the payouts when only one side wins, including the lost stake.
+    stake_a = total_stake * odds_b / (odds_a + odds_b)
     stake_a = round(stake_a, 2)
     stake_b = round(total_stake - stake_a, 2)
     return stake_a, stake_b
@@ -329,14 +333,18 @@ def _request(url: str, params: Dict[str, str]) -> requests.Response:
     try:
         resp = requests.get(url, params=params, timeout=30)
     except requests.RequestException as exc:  # pragma: no cover - network error
-        raise ScannerError(f"Network error: {exc}") from exc
+        # Request exceptions can contain the full URL, including the API key.
+        raise ScannerError("Could not reach The Odds API. Please try again.") from exc
     if resp.status_code >= 400:
         try:
             payload = resp.json()
-            message = payload.get("message") or payload.get("error")
+            message = (payload.get("message") or payload.get("error")) if isinstance(payload, dict) else None
         except ValueError:
-            message = resp.text or "Unknown error"
-        raise ScannerError(message or f"API request failed ({resp.status_code})")
+            message = None
+        message = str(message or f"API request failed ({resp.status_code})")
+        if params.get("apiKey"):
+            message = message.replace(params["apiKey"], "[redacted]")
+        raise ScannerError(message)
     return resp
 
 
@@ -344,7 +352,7 @@ def fetch_sports(api_key: str) -> List[dict]:
     url = f"{BASE_URL}/sports/"
     resp = _request(url, {"apiKey": api_key})
     try:
-        return resp.json()
+        return _parse_list_response(resp, "sports list")
     except ValueError as exc:  # pragma: no cover - malformed payload
         raise ScannerError("Failed to parse sports list") from exc
 
@@ -371,13 +379,20 @@ def fetch_odds_for_sport(
     }
     resp = _request(url, params)
     try:
-        return resp.json()
+        return _parse_list_response(resp, f"odds for {sport_key}")
     except ValueError as exc:  # pragma: no cover
         raise ScannerError(f"Failed to parse odds for {sport_key}") from exc
 
 
 OutcomeInfo = Dict[str, object]
 LineMap = Dict[str, Dict[str, OutcomeInfo]]
+
+
+def _parse_list_response(response: requests.Response, description: str) -> List[dict]:
+    payload = response.json()
+    if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+        raise ScannerError(f"Unexpected response for {description}")
+    return payload
 
 
 def _line_key(market: str, outcome: dict) -> Optional[str]:
@@ -388,7 +403,12 @@ def _line_key(market: str, outcome: dict) -> Optional[str]:
         return None
     try:
         point_val = float(point)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(point_val):
+        return None
+    # Whole lines can push; quarter lines require split-stake settlement.
+    if not math.isclose(abs(point_val) % 1, 0.5):
         return None
     if market == "spreads":
         return f"spread_{abs(point_val):.2f}"
@@ -396,7 +416,7 @@ def _line_key(market: str, outcome: dict) -> Optional[str]:
 
 
 def _record_best_prices(
-    markets: List[dict], market_key: str, commission_rate: float
+    markets: List[dict], market_key: str, commission_rate: float, home_team: Optional[str] = None
 ) -> LineMap:
     lines: LineMap = {}
     for book in markets:
@@ -406,13 +426,17 @@ def _record_best_prices(
             if market.get("key") != market_key:
                 continue
             for outcome in market.get("outcomes", []):
-                price = outcome.get("price")
-                if not price or price <= 1:
+                price = _valid_price(outcome.get("price"))
+                if price is None:
                     continue
                 key = _line_key(market_key, outcome)
                 if key is None:
                     continue
                 normalized_point = outcome.get("point")
+                if market_key == "spreads" and home_team:
+                    point = float(normalized_point)
+                    home_point = point if outcome.get("name") == home_team else -point
+                    key = f"spread_{home_point:.6f}"
                 entry = lines.setdefault(key, {})
                 name = outcome.get("name", "")
                 existing = entry.get(name)
@@ -438,22 +462,28 @@ def _collect_market_entries(
     bookmakers = game.get("bookmakers", [])
     markets = [
         {
+            "key": book.get("key"),
             "title": book.get("title") or book.get("key"),
             "markets": book.get("markets", []),
         }
         for book in bookmakers
     ]
-    best_lines = _record_best_prices(markets, market_key, commission_rate)
+    best_lines = _record_best_prices(markets, market_key, commission_rate, game.get("home_team"))
     entries = []
     for line_key, offers in best_lines.items():
         # Skip lines that aren't genuine two-way markets (e.g., moneyline with a draw option).
         if len(offers) != 2:
             continue
         outcomes = list(offers.values())
+        names = {o["name"] for o in outcomes}
+        expected = ({"Over", "Under"} if market_key == "totals"
+                    else {game.get("home_team"), game.get("away_team")})
+        if names != expected:
+            continue
         if market_key == "spreads":
             try:
                 point_values = [float(o.get("point")) for o in outcomes]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if any(p is None for p in point_values):
                 continue
@@ -529,13 +559,15 @@ def _collect_middle_opportunities(
                 continue
             for outcome in market.get("outcomes", []):
                 point = outcome.get("point")
-                price = outcome.get("price")
-                if point is None or not price or price <= 1:
+                price = _valid_price(outcome.get("price"))
+                if point is None or price is None:
                     continue
                 name = outcome.get("name") or ""
                 try:
                     point_value = float(point)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not math.isfinite(point_value):
                     continue
                 display_price = float(price)
                 is_exchange = bookmaker_key in EXCHANGE_KEYS
@@ -871,9 +903,12 @@ def _calculate_stakes(outcomes: List[dict], stake_total: float, price_field: str
             "roi_percent": 0.0,
         }
     breakdown = []
-    for outcome, inv in zip(outcomes, inverses):
+    allocated = 0.0
+    for index, (outcome, inv) in enumerate(zip(outcomes, inverses)):
         fraction = inv / inverse_sum
-        stake_value = round(stake_total * fraction, 2)
+        stake_value = (round(stake_total - allocated, 2) if index == len(outcomes) - 1
+                       else round(stake_total * fraction, 2))
+        allocated += stake_value
         price_used = outcome.get(price_field)
         display_price = outcome.get("display_price", price_used)
         payout = round(stake_value * price_used, 2)
@@ -965,7 +1000,10 @@ def _deduplicate_middles(opportunities: List[dict]) -> List[dict]:
     for opp in opportunities:
         key = (
             opp.get("event"),
+            opp.get("sport"),
+            opp.get("commence_time"),
             opp.get("market"),
+            opp.get("side_a", {}).get("team"),
             tuple(opp.get("gap", {}).get("middle_integers", [])),
         )
         if key not in best_by_key or opp.get("ev_percent", 0) > best_by_key[key].get("ev_percent", 0):
@@ -1017,11 +1055,12 @@ def _deduplicate_plus_ev(opportunities: List[dict]) -> List[dict]:
             point = opp.get("market_point")
         try:
             normalized_point = float(point) if point is not None else None
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             normalized_point = None
         key = (
             opp.get("event"),
             opp.get("sport"),
+            opp.get("commence_time"),
             opp.get("market"),
             (bet.get("outcome") or "").strip().lower(),
             normalized_point,
@@ -1063,34 +1102,6 @@ def run_scan(
         return {"success": False, "error": str(exc), "error_code": 500}
 
     filtered = filter_sports(sports_list, sports or DEFAULT_SPORT_KEYS, all_sports)
-    if not filtered:
-        arb_summary = _summaries([], 0, 0, 0.0, 0)
-        middle_summary = _middle_summary([])
-        return {
-            "success": True,
-            "scan_time": _iso_now(),
-            "arbitrage": {
-                "opportunities": [],
-                "opportunities_count": 0,
-                "summary": arb_summary,
-                "stake_amount": stake_amount,
-            },
-            "middles": {
-                "opportunities": [],
-                "opportunities_count": 0,
-                "summary": middle_summary,
-                "stake_amount": stake_amount,
-                "defaults": {
-                    "min_gap": MIN_MIDDLE_GAP,
-                    "sort": DEFAULT_MIDDLE_SORT,
-                    "positive_only": SHOW_POSITIVE_EV_ONLY,
-                },
-            },
-            "sport_errors": [],
-            "partial": False,
-            "regions": normalized_regions,
-            "commission_rate": commission_rate,
-        }
 
     arb_opportunities: List[dict] = []
     middle_opportunities: List[dict] = []
@@ -1159,6 +1170,9 @@ def run_scan(
     )
     middle_summary = _middle_summary(middle_opportunities)
     plus_ev_summary = _plus_ev_summary(plus_ev_opportunities)
+    if filtered and not successful_sports:
+        return {"success": False, "error": "All selected sports failed to load.",
+                "error_code": 502, "sport_errors": sport_errors}
     return {
         "success": True,
         "scan_time": _iso_now(),
@@ -1230,15 +1244,15 @@ def _kelly_stake(
     true_probability: float, odds: float, bankroll: float, fraction: float
 ) -> Tuple[float, float, float]:
     if bankroll <= 0 or odds <= 1:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     p = max(0.0, min(true_probability, 1.0))
     q = 1.0 - p
     b = odds - 1.0
     if b <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     kelly_fraction = (b * p - q) / b
     if kelly_fraction <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     fraction = max(0.0, min(fraction, 1.0))
     recommended_fraction = kelly_fraction * fraction
     stake = round(bankroll * recommended_fraction, 2)
