@@ -28,52 +28,15 @@ EXCHANGE_BOOKMAKERS = {
 EXCHANGE_KEYS = set(EXCHANGE_BOOKMAKERS.keys())
 
 DEFAULT_COMMISSION = 0.05  # 5%
+MAX_REFERENCE_MARGIN_PERCENT = 5.0
 
 # -----------------------------------------------------------------------------
 # Middles configuration
 # -----------------------------------------------------------------------------
 
 MIN_MIDDLE_GAP = 1.5
-DEFAULT_MIDDLE_SORT = "ev"
-SHOW_POSITIVE_EV_ONLY = True
-
-PROBABILITY_PER_INTEGER = {
-    # Spreads
-    "americanfootball_nfl_spreads": 0.025,
-    "americanfootball_ncaaf_spreads": 0.025,
-    "basketball_nba_spreads": 0.025,
-    "basketball_ncaab_spreads": 0.025,
-    "baseball_mlb_spreads": 0.030,
-    "icehockey_nhl_spreads": 0.030,
-    # Totals
-    "americanfootball_nfl_totals": 0.030,
-    "americanfootball_ncaaf_totals": 0.030,
-    "basketball_nba_totals": 0.020,
-    "basketball_ncaab_totals": 0.020,
-    "baseball_mlb_totals": 0.045,
-    "icehockey_nhl_totals": 0.055,
-    "default": 0.030,
-}
-
-NFL_KEY_NUMBER_PROBABILITY = {
-    3: 0.150,
-    7: 0.090,
-    10: 0.060,
-    6: 0.050,
-    14: 0.045,
-    4: 0.040,
-    1: 0.035,
-    17: 0.035,
-    13: 0.030,
-    11: 0.025,
-}
-
-KEY_NUMBER_SPORTS = {
-    "americanfootball_nfl",
-    "americanfootball_ncaaf",
-}
-
-MAX_MIDDLE_PROBABILITY = 0.35
+DEFAULT_MIDDLE_SORT = "break_even"
+SHOW_POSITIVE_EV_ONLY = False
 
 SPORT_DISPLAY_NAMES = {
     "americanfootball_nfl": "NFL",
@@ -118,8 +81,7 @@ DEFAULT_SPORT_KEYS = [
 ]
 
 DEFAULT_SPORT_OPTIONS = [
-    {"key": key, "label": SPORT_DISPLAY_NAMES.get(key, key)}
-    for key in DEFAULT_SPORT_KEYS
+    {"key": key, "label": SPORT_DISPLAY_NAMES.get(key, key)} for key in DEFAULT_SPORT_KEYS
 ]
 
 AMERICAN_MARKETS = ["h2h", "spreads", "totals"]
@@ -152,25 +114,6 @@ KELLY_OPTIONS = [
     {"label": "Tenth Kelly", "value": 0.1},
 ]
 
-SOFT_BOOK_KEYS = [
-    "draftkings",
-    "fanduel",
-    "betmgm",
-    "caesars",
-    "pointsbetus",
-    "pointsbet",
-    "betrivers",
-    "unibet",
-    "888sport",
-    "bovada",
-    "betonlineag",
-    "lowvig",
-    "williamhill_us",
-    "betway",
-    "sportsbettingag",
-    "barstool",
-]
-
 EDGE_BANDS = [
     (1.0, 3.0, "1-3%"),
     (3.0, 5.0, "3-5%"),
@@ -180,8 +123,10 @@ EDGE_BANDS = [
 
 
 def markets_for_sport(sport_key: str) -> list[str]:
-    if sport_key in AMERICAN_SPORTS:
+    if sport_key in AMERICAN_SPORTS or sport_key.startswith(
+        ("americanfootball_", "basketball_", "baseball_", "icehockey_")
+    ):
         return AMERICAN_MARKETS
-    if sport_key in SOCCER_SPORTS:
+    if sport_key.startswith("soccer_"):
         return SOCCER_MARKETS
-    return SOCCER_MARKETS.copy()
+    return ["h2h"]

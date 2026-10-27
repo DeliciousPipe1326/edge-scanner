@@ -619,3 +619,21 @@ main {
   background: rgba(148, 163, 184, 0.3);
   color: #475569;
 }
+
+dialog {
+  max-width: min(680px, 90vw);
+  max-height: 85vh;
+  overflow: auto;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 24px;
+}
+
+dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+.execution { min-width: 150px; margin-bottom: 6px; font-size: 0.85rem; }
+.execution small, td small { display: block; color: var(--text-muted); }
+details { max-height: 240px; overflow: auto; white-space: nowrap; }
+summary { cursor: pointer; }
+.status.warning { color: var(--warning); }

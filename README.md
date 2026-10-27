@@ -2,14 +2,14 @@
 
 **Arbitrage • Middles • +EV**
 
-Open-source sports betting scanner that finds arbitrage opportunities, middle bets, and +EV plays across US and EU bookmakers.
+Open-source sports betting scanner that finds arbitrage opportunities, middle bets, and +EV plays across US, UK, EU, and Australian bookmakers returned by The Odds API.
 
 ## Features
 
 | Tab | What it finds | Risk profile |
 |-----|---------------|--------------|
 | **Arbitrage** | Positive modeled return by covering both sides | Execution and settlement risk |
-| **Middles** | Line gaps where both bets can win if the result lands in between | High variance; EV uses uncalibrated estimates |
+| **Middles** | Line gaps where both bets can win if the result lands in between | Exact payoff scenarios and conservative break-even thresholds |
 | **+EV** | Soft book odds better than a de-vigged sharp reference price | Model risk and variance |
 
 ## How It Works
@@ -18,7 +18,7 @@ The scanner pulls odds from The Odds API across multiple regions (US, EU, UK, AU
 
 1. **Arbitrage** — finds where the sum of inverse odds across books is less than 1, then calculates cent-rounded stakes and net return after exchange commission
 2. **Middles** — finds where books disagree on spreads/totals, creating a gap where both sides can win
-3. **+EV** — compares soft book odds to sharp reference (Pinnacle), identifying bets with positive expected value
+3. **+EV** — compares matching soft-book outcomes against a qualified de-vigged reference; edges remain estimates under that market model
 
 ## Setup
 
@@ -38,7 +38,9 @@ python app.py
 3. Get a free API key from [The Odds API](https://the-odds-api.com/)
 4. Run: `python app.py`
 
-Your browser opens automatically. Enter your API key and scan.
+Your browser opens automatically. Enter your API key, choose your settings, and select **Scan Now**. Review the maximum credit cost, then confirm **Run scan**. Canceling the preview makes no paid odds requests. **Download JSON** saves the complete timestamped response without the API key.
+
+Use `python app.py --port 5050` to choose a preferred port, or `--port 0` to bind an available OS-assigned port. The browser opens the actual bound port.
 
 This is a local desktop tool. Host validation permits localhost and loopback addresses only. It has no user authentication or shared-server deployment support. Keys are accepted from the form or environment and are not saved by the app.
 
@@ -51,34 +53,47 @@ ODDS_API_KEY=your_api_key_here
 
 | Sport | Markets |
 |-------|---------|
-| NFL, NBA, MLB, NHL | Moneyline, Spreads, Totals |
-| Soccer (EPL, La Liga, etc.) | Spreads, Totals only* |
+| American football, basketball, baseball, ice hockey | Moneyline, Spreads, Totals |
+| Soccer (including leagues selected with all-sports) | Spreads, Totals only* |
+| Other active non-outright sports | Moneyline; only genuine two-way markets are calculated |
 
 *Soccer moneyline is three-way (win/draw/lose) — excluded from two-way scanning.
 
-Arbitrage and +EV spread/total calculations support **half-point lines only**. Whole-point lines can push, and quarter-point lines require split-stake settlement; both are excluded until those outcomes are modeled. Middle estimates can include whole-point lines but do not account for endpoint pushes.
+Arbitrage and +EV spread/total calculations support **half-point lines only**. Whole-point lines can push, and quarter-point lines require split-stake settlement; both are excluded until those outcomes are modeled. Middles support whole- and half-point lines for integer-scored sports, including exact endpoint pushes. Quarter lines are excluded. Unsupported markets are excluded rather than assigned simplified settlement rules.
 
 ## API Usage
 
 Each scan makes one sports-list request (quota-free) and one odds request per active selected sport. **Requests and credits differ:** odds quota cost is markets × regions. A three-market US/EU request can cost six credits. The scanner also includes the selected sharp reference's region (normally EU), even if you did not select it.
 
-The UI reports odds request count, not credits consumed. Actual quota usage is available in the provider's `x-requests-last`, `x-requests-used`, and `x-requests-remaining` response headers. See [The Odds API quota documentation](https://the-odds-api.com/liveapi/guides/v4/#usage-quota-costs-1) and your account plan for current limits.
+Before each scan, the quota-free `/plan` request lists active selected sports, effective regions, estimated maximum credits, and the account's remaining credits. `/scan` checks that bound again before making paid requests. Concurrent scans are rejected; authentication failures, rate limiting, and depleted quota stop further requests.
+
+The UI reports actual scan credits, remaining credits, and odds request count separately using `x-requests-last`, `x-requests-used`, and `x-requests-remaining`. Missing headers or interrupted requests produce **unknown** usage rather than an invented zero. See [The Odds API quota documentation](https://the-odds-api.com/liveapi/guides/v4/#usage-quota-costs-1).
+
+API clients must provide `maxCredits` in `/scan` JSON (the default budget is zero). Optional fields include `maxQuoteAge` (15–900 seconds, default 120) `windowHours` (`24`, `48`, `168`, or `null` for Infinite), and `bookmakers` (a list of result-filter keys). Regions still determine quota cost; bookmaker filters do not reduce requests.
+
+## Quote and reference quality
+
+- Only future events within the selected event window, with valid complete market outcomes, are used. The time window is applied in the provider request and validated again against returned events. Stale, missing, invalid, or future-dated quote timestamps are excluded; market timestamps take precedence over bookmaker timestamps.
+- Results expire at the earliest contributing quote's age limit or event start, both on the server and in the browser. Expiry removes rows without replacing still-valid expanded payoff details every second.
+- The API is asked for bet limits. Arbitrage searches price combinations that can accommodate the requested stakes when limits are supplied. The browser also hides candidates exceeding reported limits after stake/bankroll changes. Missing limits remain explicitly **unverified**; prices and settlement rules still need checking at the books.
+- +EV references fall back per matching market and signed line, in selected-book priority order. References with an absolute implied margin above 5% are excluded. Exchange references additionally require positive reported limits for both sides. Diagnostics distinguish an unavailable reference from the absence of a positive edge.
+- All returned regional soft books are eligible, without an aging name allowlist. Optional target-book keys filter all tabs while leaving sharp references available. Suggestions come from fresh observed coverage.
 
 ## Understanding the Results
 
 ### Arbitrage
 
-ROI = guaranteed return on total stake. A 2% ROI means $2 profit on $100 staked.
+ROI is the modeled minimum return on total stake, conditional on both bets being accepted and settling as modeled. A 2% ROI means $2 profit on $100 staked.
 
-Stakes target equal payouts, with cent rounding reflected in the reported minimum return. Quotes are snapshots: changes in odds, stake limits, exchange liquidity, void bets, and differing bookmaker settlement rules can invalidate a modeled return. Gross-positive exchange candidates may still have a negative net return; inspect net ROI.
+Stakes target equal payouts, with cent rounding reflected in the reported minimum return. Quotes are snapshots: changes in odds, stake limits, exchange liquidity, void bets, and differing bookmaker settlement rules can invalidate a modeled return. Only positive net-return arbitrage candidates are returned; exchange commission and cent rounding are applied before that check. Results can share outcomes, so summing their modeled profits is not a realizable portfolio return.
 
 ### Middles
 
-EV uses fixed probability weights from `config.py`. These are uncalibrated heuristics; the repository contains no historical dataset or backtest establishing their accuracy. The calculation assumes each miss direction is equally likely and omits pushes.
+The previous fixed probability weights have been removed. The scanner does **not** predict a middle probability or label a middle +EV without a validated outcome distribution.
 
-NFL key numbers (3, 7) significantly boost probability for spread middles — these margins occur more often due to field goals and touchdowns.
+Instead it shows cent-rounded stakes, all distinct integer-score payoff scenarios (including pushes), the worst payoff, the both-win payoff, and a conservative break-even probability. If the worst non-middle result loses $5 and winning both earns $90, the threshold is `5 / (90 + 5) = 5.26%`. That is the required frequency, not an estimate that the middle occurs 5.26% of the time. Assigning every non-middle result its worst payoff makes this threshold conservative.
 
-Middles can lose on one side and win both inside the gap. A positive estimated EV does not establish profitability.
+First and last scenario rows represent the outside tails. For spreads, scores represent the displayed side A team's winning margin and can be negative. Changing the total stake recalculates the scenarios and threshold in cents, rather than scaling previously rounded stakes.
 
 ### +EV
 
@@ -99,6 +114,10 @@ Configurable via the UI:
 - Sharp reference book (Pinnacle, Betfair, Matchbook)
 - Kelly fraction (full, half, quarter, tenth)
 - Stake amount / bankroll
+- Event window: **24 hours** (default), **48 hours**, **7 days**, or **Infinite** (all future events returned by the API)
+- Minimum net ROI for displaying paper arbitrage candidates (default 2%)
+- Maximum quote age
+- Optional target-bookmaker keys
 
 ## Tech Stack
 
@@ -119,7 +138,7 @@ python -m unittest discover -s tests -v
 node --test tests/frontend.test.cjs  # Node.js 22+; no npm dependencies
 ```
 
-CI runs the Python tests on 3.11–3.14, frontend regressions, Ruff checks, and a dependency vulnerability audit. Install `ruff==0.17.2` and `pip-audit==2.10.1` for the same optional local checks.
+CI runs the Python tests on 3.11–3.14 on Linux, a Windows 3.14 check, frontend regressions, Ruff checks, and a dependency vulnerability audit. Install `ruff==0.17.2` and `pip-audit==2.10.1` for the same optional local checks.
 
 Direct dependency ranges live in `requirements.in`; `requirements.txt` pins the complete dependency tree with hashes. To update it using [uv](https://docs.astral.sh/uv/):
 
@@ -129,19 +148,17 @@ python -m pip install --require-hashes -r requirements.txt
 pip-audit -r requirements.txt
 ```
 
-### Technical follow-up priorities
+### Acceptance coverage
 
-- Track actual quota headers and show scan cost before starting an all-sports scan.
-- Check quote ages and exchange liquidity before treating prices as actionable.
-- Calibrate middle probabilities against historical results and model pushes and split settlements.
-- Refresh regional bookmaker coverage and replace the fixed soft-book allowlist with explicit user selection.
-- Split the inline frontend script into modules once these behaviors have regression coverage.
+The offline suite exercises quota preview and budgets, actual/missing quota headers, stale and malformed provider data, rate-limit stopping, partial failures, regional book selection, reference quality, liquidity fallback, stake rounding, push settlement, and the Flask-to-provider boundary. Frontend tests cover two-step scan confirmation and cancellation, expired results, HTML escaping, limit checks, live stake changes, and recoverable errors.
 
-PRs welcome. Ideas for future versions:
-- Alerts/notifications
-- Historical tracking
-- Three-way arbitrage (soccer moneylines)
-- Player props
+The maintenance release was also exercised against the live NBA endpoint: two six-credit scans processed seven events each, with the response quota moving from 500 to 488. The retained local response lives under ignored `data/`; no API key or live snapshot is included in the repository. Subsequent reference-quality regressions use the poor-margin exchange prices observed in that check without additional API calls.
+
+### Supported product scope
+
+This is a local analysis tool, not an automated bet-placement system. It does not authenticate to bookmakers, reserve prices or liquidity, validate account-specific eligibility/currency, or guarantee realized returns. It supports two-way arbitrage and +EV modeling on the markets above, plus deterministic middle payoff analysis. Three-way arbitrage, Asian quarter-line settlement, player props, and empirically calibrated middle prediction are outside the current product scope.
+
+MIT licensed. Contributions are welcome.
 
 ## Support
 

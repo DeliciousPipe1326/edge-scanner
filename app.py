@@ -26,13 +26,17 @@ from config import (
     REGION_CONFIG,
     SHARP_BOOKS,
 )
-from scanner import run_scan
+from scanner import plan_scan, run_scan
+from werkzeug.exceptions import HTTPException
+from werkzeug.serving import make_server
+from quality import DEFAULT_MAX_AGE
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 app.config["TRUSTED_HOSTS"] = ["localhost", "127.0.0.1", "[::1]"]
+SCAN_LOCK = threading.Lock()
 ENV_API_KEY = os.getenv("ODDS_API_KEY") or os.getenv("THEODDSAPI_API_KEY")
 
 
@@ -50,9 +54,17 @@ def index() -> str:
         default_bankroll=DEFAULT_BANKROLL,
         default_kelly_fraction=DEFAULT_KELLY_FRACTION,
         kelly_options=KELLY_OPTIONS,
+        scanner_config={
+            "hasEnvKey": bool(ENV_API_KEY),
+            "defaultSharpBook": DEFAULT_SHARP_BOOK,
+            "defaultMinEdgePercent": MIN_EDGE_PERCENT,
+            "defaultBankroll": DEFAULT_BANKROLL,
+            "defaultKellyFraction": DEFAULT_KELLY_FRACTION,
+        },
     )
 
 
+@app.route("/plan", methods=["POST"])
 @app.route("/scan", methods=["POST"])
 def scan() -> tuple:
     if not request.is_json:
@@ -77,6 +89,8 @@ def scan() -> tuple:
         all_sports = payload.get("allSports", False)
         if not isinstance(all_sports, bool):
             raise ValueError("allSports must be a boolean")
+        if "sports" in payload and not sports and not all_sports:
+            raise ValueError("Select at least one sport")
         regions_value = payload.get("regions", DEFAULT_REGION_KEYS)
         if (
             not isinstance(regions_value, list)
@@ -97,20 +111,51 @@ def scan() -> tuple:
         min_edge_percent = _number(payload, "minEdgePercent", MIN_EDGE_PERCENT, 0, 100)
         bankroll_value = _number(payload, "bankroll", DEFAULT_BANKROLL, 0, 1e9)
         kelly_fraction = _number(payload, "kellyFraction", DEFAULT_KELLY_FRACTION, 0, 1)
+        max_quote_age = _number(payload, "maxQuoteAge", DEFAULT_MAX_AGE, 15, 900)
+        window_hours = payload.get("windowHours", 24)
+        if window_hours is not None and (
+            isinstance(window_hours, bool) or window_hours not in (24, 48, 168)
+        ):
+            raise ValueError("windowHours must be 24, 48, 168, or null for Infinite")
+        max_credits = _number(payload, "maxCredits", 0, 0, 100000)
+        if max_credits != int(max_credits):
+            raise ValueError("maxCredits must be an integer")
+        target_books = payload.get("bookmakers", [])
+        if (
+            not isinstance(target_books, list)
+            or len(target_books) > 100
+            or any(
+                not isinstance(key, str) or not re.fullmatch(r"[a-z0-9_]+", key)
+                for key in target_books
+            )
+        ):
+            raise ValueError("bookmakers must be a list of bookmaker keys")
     except ValueError as exc:
         return jsonify(success=False, error=str(exc)), 400
-    result = run_scan(
-        api_key,
-        sports,
-        all_sports,
-        stake_value,
-        regions_value or DEFAULT_REGION_KEYS,
-        commission_rate,
-        sharp_book=sharp_book,
-        min_edge_percent=min_edge_percent,
-        bankroll=bankroll_value,
-        kelly_fraction=kelly_fraction,
-    )
+    if request.path == "/plan":
+        result = plan_scan(api_key, sports, all_sports, regions_value, sharp_book, window_hours)
+    else:
+        if not SCAN_LOCK.acquire(blocking=False):
+            return jsonify(success=False, error="A scan is already running. Please wait."), 409
+        try:
+            result = run_scan(
+                api_key,
+                sports,
+                all_sports,
+                stake_value,
+                regions_value,
+                commission_rate,
+                sharp_book=sharp_book,
+                min_edge_percent=min_edge_percent,
+                bankroll=bankroll_value,
+                kelly_fraction=kelly_fraction,
+                max_quote_age=max_quote_age,
+                target_books=target_books,
+                max_credits=int(max_credits),
+                window_hours=window_hours,
+            )
+        finally:
+            SCAN_LOCK.release()
     status = 200 if result.get("success") else result.get("error_code", 500)
     return jsonify(result), status
 
@@ -126,16 +171,27 @@ def _number(payload: dict, key: str, default: float, lower: float, upper: float)
     return number
 
 
+@app.errorhandler(HTTPException)
+def http_error(error):
+    if request.path in {"/plan", "/scan"}:
+        return jsonify(success=False, error=error.description), error.code
+    return error
+
+
 @app.after_request
 def response_headers(response):
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
     return response
 
 
 def _port_available(port: int) -> bool:
-    if port <= 0:
+    if not 0 < port <= 65535:
         return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -148,6 +204,8 @@ def _port_available(port: int) -> bool:
 
 
 def _choose_port(preferred: Optional[int]) -> int:
+    if preferred == 0:
+        return 0
     candidates = []
     if preferred:
         candidates.append(preferred)
@@ -179,19 +237,22 @@ def main() -> None:
         help="Port to run the local server on (default 5000, auto-fallback if busy)",
     )
     args = parser.parse_args()
+    if args.port is not None and not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
 
     ensure_data_dir()
     port = _choose_port(args.port)
-    if port > 0:
-        timer = threading.Timer(1.0, open_browser, args=(port,))
-        timer.start()
-    else:
-        timer = None
+    server = make_server("127.0.0.1", port, app, threaded=True)
+    timer = threading.Timer(0.3, open_browser, args=(server.server_port,))
+    timer.daemon = True
+    timer.start()
     try:
-        app.run(port=port or 0, debug=False)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        if timer:
-            timer.cancel()
+        timer.cancel()
+        server.server_close()
 
 
 if __name__ == "__main__":

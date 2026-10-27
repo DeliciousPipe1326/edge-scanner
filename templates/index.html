@@ -40,7 +40,7 @@
           {% endif %}
           <div class="field">
             <label class="field-label">Total Stake ($)</label>
-            <input type="number" id="stake-input" min="1" step="1" value="100" />
+            <input type="number" id="stake-input" min="0.01" max="1000000000" step="0.01" value="100" />
             <p class="helper">Used for arbitrage + middles stake splits.</p>
           </div>
           <div class="field">
@@ -57,7 +57,7 @@
               <input type="checkbox" id="all-sports" />
               <span>Scan all active sports (uses more API credits)</span>
             </label>
-            <p class="helper">Each selected sport consumes one API request.</p>
+            <p class="helper">Review active sports and credit cost before each scan.</p>
           </div>
           <div class="field">
             <label class="field-label">Regions</label>
@@ -71,6 +71,31 @@
             </div>
             <p class="helper">Select at least one region. EU is always included for sharp reference.</p>
           </div>
+          <div class="field">
+            <label class="field-label" for="window-select">Event Window</label>
+            <select id="window-select">
+              <option value="24" selected>24 hours</option>
+              <option value="48">48 hours</option>
+              <option value="168">7 days</option>
+              <option value="all">Infinite — all available future events</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="min-roi-input">Minimum Net ROI (%)</label>
+            <input type="number" id="min-roi-input" min="0" max="100" step="0.1" value="2" />
+            <p class="helper">Filters paper arbitrage candidates after commission and stake rounding.</p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="max-age-input">Maximum Quote Age (seconds)</label>
+            <input type="number" id="max-age-input" min="15" max="900" step="1" value="120" />
+            <p class="helper">Stale, undated, and started-event quotes are excluded. Results expire automatically.</p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="bookmakers-input">Target Bookmakers (optional keys)</label>
+            <input id="bookmakers-input" list="bookmaker-options" placeholder="All books in selected regions" autocomplete="off" />
+            <datalist id="bookmaker-options"></datalist>
+            <p class="helper">Comma-separated keys. Filters results, not API cost. Suggestions use fresh coverage from your last scan. Sharp books remain available as references.</p>
+          </div>
           <div class="field commission-field">
             <div class="commission-box">
               <div>
@@ -78,7 +103,7 @@
                 <p class="helper">Applied to Betfair, Matchbook, Sportsbet Exchange, etc.</p>
               </div>
               <div class="input-wrap">
-                <input type="number" id="commission-input" min="0" max="15" step="0.5" value="{{ default_commission_percent }}" />
+                <input type="number" id="commission-input" min="0" max="20" step="0.5" value="{{ default_commission_percent }}" />
               </div>
               <p class="helper">Net ROI/EV already reflects this commission.</p>
               <p class="helper">Odds requests can cost multiple credits: markets × regions. The sharp reference may add EU.</p>
@@ -87,11 +112,14 @@
         </div>
         <div class="actions">
           <button type="submit" id="scan-btn">Scan Now</button>
-          <div id="status" class="status"></div>
+          <button type="button" id="download-results" disabled>Download JSON</button>
+          <div id="status" class="status" role="status" aria-live="polite"></div>
         </div>
       </form>
     </section>
 
+    <div id="partial-warning" class="alert warning hidden" role="alert"></div>
+    <div id="scan-meta" class="alert hidden" role="status"></div>
     <nav class="tabs">
       <button type="button" class="tab-btn active" data-tab="arbitrage">Arbitrage</button>
       <button type="button" class="tab-btn" data-tab="middles">Middles</button>
@@ -108,15 +136,14 @@
         <div class="field toggle-field">
           <label class="field-label">Filters</label>
           <label class="checkbox">
-            <input type="checkbox" id="positive-ev-toggle" checked />
-            <span>Show only positive EV middles</span>
+            <input type="checkbox" id="no-loss-toggle" />
+            <span>Show only middles with no modeled loss</span>
           </label>
         </div>
         <div class="field">
           <label class="field-label">Sort By</label>
           <select id="middle-sort">
-            <option value="ev">Estimated EV</option>
-            <option value="probability">Probability</option>
+            <option value="break_even">Lowest break-even probability</option>
             <option value="gap">Gap size</option>
             <option value="time">Event time</option>
           </select>
@@ -133,7 +160,7 @@
             <option value="{{ book.key }}" {% if book.key == default_sharp_book %}selected{% endif %}>{{ book.name }}</option>
             {% endfor %}
           </select>
-          <p class="helper">Reference prices used to estimate fair odds after removing vig.</p>
+          <p class="helper">Reference prices estimate fair odds after removing vig. Margins above 5% and exchange references without reported liquidity are excluded.</p>
         </div>
         <div class="field">
           <label class="field-label">Minimum Edge (%)</label>
@@ -185,7 +212,7 @@
       </section>
 
       <section id="summary-info" class="card summary-info hidden"></section>
-      <div id="partial-warning" class="alert warning hidden"></div>
+
 
       <section class="summary-grid">
         <div class="card summary-card" id="roi-card">
@@ -204,7 +231,7 @@
 
       <section class="card results-card">
         <div class="card-head">
-          <h3>Opportunities</h3>
+          <h3>Arbitrage Candidates</h3>
           <div class="table-meta">
             <span id="table-count">0 results</span>
             <span class="muted">Sorted by ROI</span>
@@ -215,7 +242,7 @@
             <tr>
               <th>Net ROI</th>
               <th>Gross ROI</th>
-              <th>Profit</th>
+              <th>Modeled Return</th>
               <th>Exchange</th>
               <th>Sport</th>
               <th>Event</th>
@@ -223,6 +250,7 @@
               <th>Market</th>
               <th>Outcome 1</th>
               <th>Outcome 2</th>
+              <th>Quote / Limits</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -238,15 +266,15 @@
           <span class="stat-value" id="middle-stat-count">0</span>
         </div>
         <div class="stat-card">
-          <span class="stat-label">+EV Middles</span>
+          <span class="stat-label">No-loss Middles</span>
           <span class="stat-value" id="middle-stat-positive">0</span>
         </div>
         <div class="stat-card">
-          <span class="stat-label">Avg EV</span>
+          <span class="stat-label">Avg Break-even</span>
           <span class="stat-value" id="middle-stat-avg">0%</span>
         </div>
         <div class="stat-card">
-          <span class="stat-label">Best EV</span>
+          <span class="stat-label">Lowest Break-even</span>
           <span class="stat-value" id="middle-stat-best">0%</span>
         </div>
       </section>
@@ -260,12 +288,6 @@
           </div>
           <div id="middles-sport-bars" class="bar-list"></div>
         </div>
-        <div class="card summary-card" id="middles-key-card">
-          <div class="card-head">
-            <h3>Key Numbers</h3>
-          </div>
-          <div id="middles-key-bars" class="bar-list"></div>
-        </div>
       </section>
 
       <section class="card results-card">
@@ -273,14 +295,14 @@
           <h3>Middles</h3>
           <div class="table-meta">
             <span id="middles-table-count">0 results</span>
-            <span class="muted">Sorted by EV</span>
+            <span class="muted">Sorted by break-even probability</span>
           </div>
         </div>
         <table id="middles-table">
           <thead>
             <tr>
-              <th>EV</th>
-              <th>Prob</th>
+              <th>Break-even Prob.</th>
+              <th>Worst Payoff</th>
               <th>Gap</th>
               <th>Sport</th>
               <th>Event</th>
@@ -290,7 +312,7 @@
               <th>Side B</th>
               <th>Middle</th>
               <th>Win Both</th>
-              <th>Miss</th>
+              <th>Quote / Limits</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -299,7 +321,7 @@
       </section>
 
       <section class="card middle-caveat">
-        <p><strong>Understanding Middles:</strong> Middles are high-variance plays. They typically lose small amounts and win big when the final score lands inside the gap. Probabilities use fixed, uncalibrated heuristics, including football key-number weights. Estimated EV assumes the two miss outcomes are equally likely and omits pushes. It does not establish a profitable strategy.</p>
+        <p><strong>Understanding Middles:</strong> Middles are high-variance plays. They typically lose small amounts and win big when the final score lands inside the gap. No middle probability or EV is predicted without a validated outcome distribution. Break-even probability is the frequency of winning both bets required to cover the worst non-middle payoff. Payoff scenarios include whole-line pushes. First and last scenario rows represent the outside tails.</p>
       </section>
     </section>
 
@@ -362,6 +384,7 @@
               <th>Soft Odds</th>
               <th>Fair Odds</th>
               <th>Est. Prob</th>
+              <th>Quote / Limits</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -373,879 +396,17 @@
         <p><strong>Understanding +EV Betting:</strong> Sharp books (Pinnacle, Betfair, Matchbook) provide reference prices; removing vig does not establish true probabilities. A higher soft-book price implies positive EV under that reference model. Win rates depend on the odds, and estimated edges can be wrong. Kelly staking helps size bets, but variance can still be high. Always confirm odds before betting; edges disappear quickly.</p>
       </section>
     </section>
+    <dialog id="plan-dialog" aria-labelledby="plan-title">
+      <h2 id="plan-title">Review scan cost</h2>
+      <p id="plan-summary"></p>
+      <p id="plan-sports" class="helper"></p>
+      <p>Planning uses the quota-free sports endpoint. No paid odds requests run until you confirm.</p>
+      <div class="actions"><button type="button" id="cancel-plan">Cancel</button><button type="button" id="confirm-scan">Run scan</button></div>
+    </dialog>
   </main>
 
-  <script>
-    window.edgeScannerConfig = {
-      hasEnvKey: {{ 'true' if has_env_key else 'false' }},
-      sharpBooks: {{ sharp_books | tojson }},
-      defaultSharpBook: "{{ default_sharp_book }}",
-      defaultMinEdgePercent: {{ default_min_edge_percent }},
-      defaultBankroll: {{ default_bankroll }},
-      defaultKellyFraction: {{ default_kelly_fraction }},
-      kellyOptions: {{ kelly_options | tojson }}
-    };
-  </script>
+  <script id="scanner-config" type="application/json">{{ scanner_config | tojson }}</script>
 
-  <script>
-    const appConfig = window.edgeScannerConfig || {};
-    const hasEnvKey = appConfig.hasEnvKey === true || appConfig.hasEnvKey === 'true';
-    const form = document.getElementById('scan-form');
-    const apiKeyInput = document.getElementById('api-key');
-    const stakeInput = document.getElementById('stake-input');
-    const scanBtn = document.getElementById('scan-btn');
-    const statusEl = document.getElementById('status');
-    const summaryEl = document.getElementById('summary-info');
-    const resultsBody = document.querySelector('#results-table tbody');
-    const emptyState = document.getElementById('table-empty');
-    const allSportsToggle = document.getElementById('all-sports');
-    const summaryROI = document.getElementById('roi-bars');
-    const summarySport = document.getElementById('sport-bars');
-    const tableCount = document.getElementById('table-count');
-    const statOpps = document.querySelector('#stat-opps .stat-value');
-    const statEvents = document.querySelector('#stat-events .stat-value');
-    const statSports = document.querySelector('#stat-sports .stat-value');
-    const statCalls = document.querySelector('#stat-calls .stat-value');
-    const themeToggle = document.getElementById('theme-toggle');
-    const toggleKeyBtn = document.getElementById('toggle-key');
-    const currencyFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
-    const partialWarning = document.getElementById('partial-warning');
-    const commissionInput = document.getElementById('commission-input');
-    const tabs = document.querySelectorAll('.tab-btn');
-    const arbitragePanel = document.getElementById('arbitrage-panel');
-    const middlesPanel = document.getElementById('middles-panel');
-    const plusEvPanel = document.getElementById('plus-ev-panel');
-    const middlesConfig = document.getElementById('middles-config');
-    const plusEvConfig = document.getElementById('plus-ev-config');
-    const minGapInput = document.getElementById('min-gap-input');
-    const positiveEvToggle = document.getElementById('positive-ev-toggle');
-    const middleSortSelect = document.getElementById('middle-sort');
-    const middleStatCount = document.getElementById('middle-stat-count');
-    const middleStatPositive = document.getElementById('middle-stat-positive');
-    const middleStatAvg = document.getElementById('middle-stat-avg');
-    const middleStatBest = document.getElementById('middle-stat-best');
-    const middleSummaryInfo = document.getElementById('middles-summary-info');
-    const middleSportBars = document.getElementById('middles-sport-bars');
-    const middleKeyBars = document.getElementById('middles-key-bars');
-    const middleKeyCard = document.getElementById('middles-key-card');
-    const middlesTableBody = document.querySelector('#middles-table tbody');
-    const middlesTableCount = document.getElementById('middles-table-count');
-    const middlesEmpty = document.getElementById('middles-empty');
-    const sharpSelect = document.getElementById('sharp-book-select');
-    const minEdgeInput = document.getElementById('min-edge-input');
-    const bankrollInput = document.getElementById('bankroll-input');
-    const kellySelect = document.getElementById('kelly-select');
-    const plusEvSortSelect = document.getElementById('plus-ev-sort');
-    const plusEvCount = document.getElementById('plus-ev-count');
-    const plusEvAvg = document.getElementById('plus-ev-avg');
-    const plusEvBest = document.getElementById('plus-ev-best');
-    const plusEvTotal = document.getElementById('plus-ev-total');
-    const plusEvSummaryInfo = document.getElementById('plus-ev-summary-info');
-    const plusEvSportBars = document.getElementById('plus-ev-sport-bars');
-    const plusEvEdgeBars = document.getElementById('plus-ev-edge-bars');
-    const plusEvTableBody = document.querySelector('#plus-ev-table tbody');
-    const plusEvTableCount = document.getElementById('plus-ev-table-count');
-    const plusEvEmpty = document.getElementById('plus-ev-empty');
-    const oddsToggle = document.getElementById('odds-toggle');
-    const defaultCommissionPercent = parseFloat(commissionInput.value) || 5;
-    let lastCommissionRate = defaultCommissionPercent / 100;
-    let lastScanData = null;
-    let activeTab = 'arbitrage';
-    let oddsFormat = localStorage.getItem('edge-odds-format') || 'decimal';
-
-    document.addEventListener('DOMContentLoaded', () => {
-      const savedTheme = localStorage.getItem('arb-theme');
-      if (savedTheme) {
-        document.documentElement.dataset.theme = savedTheme;
-        themeToggle.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
-      }
-      updateOddsToggle();
-    });
-
-    if (toggleKeyBtn && apiKeyInput) {
-      toggleKeyBtn.addEventListener('click', () => {
-        if (apiKeyInput.type === 'password') {
-          apiKeyInput.type = 'text';
-          toggleKeyBtn.textContent = '🙈';
-        } else {
-          apiKeyInput.type = 'password';
-          toggleKeyBtn.textContent = '👁';
-        }
-      });
-    }
-
-    themeToggle.addEventListener('click', () => {
-      const current = document.documentElement.dataset.theme || 'light';
-      const next = current === 'light' ? 'dark' : 'light';
-      document.documentElement.dataset.theme = next;
-      localStorage.setItem('arb-theme', next);
-      themeToggle.textContent = next === 'dark' ? '☀️' : '🌙';
-    });
-
-    if (oddsToggle) {
-      oddsToggle.addEventListener('click', () => {
-        oddsFormat = oddsFormat === 'decimal' ? 'american' : 'decimal';
-        localStorage.setItem('edge-odds-format', oddsFormat);
-        updateOddsToggle();
-        renderArbitrage();
-        renderMiddles();
-        renderPlusEv();
-      });
-    }
-
-    tabs.forEach((tab) => {
-      tab.addEventListener('click', () => {
-        const target = tab.dataset.tab;
-        if (target && target !== activeTab) {
-          setActiveTab(target);
-        }
-      });
-    });
-
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      if (!hasEnvKey && !apiKeyInput?.value.trim()) {
-        showStatus('Please enter your API key.', 'error');
-        return;
-      }
-      const sports = Array.from(form.querySelectorAll('input[name="sports"]:checked')).map((el) => el.value);
-      const regions = Array.from(form.querySelectorAll('input[name="regions"]:checked')).map((el) => el.value);
-      if (!regions.length) {
-        showStatus('Select at least one region.', 'error');
-        return;
-      }
-      const stakeValue = parseFloat(stakeInput.value) || 100;
-      const commissionValue = Number.isFinite(parseFloat(commissionInput.value))
-        ? parseFloat(commissionInput.value)
-        : defaultCommissionPercent;
-      await runScan({
-        apiKey: apiKeyInput ? apiKeyInput.value.trim() : '',
-        sports,
-        regions,
-        commission: commissionValue,
-        allSports: allSportsToggle.checked,
-        stake: stakeValue,
-        sharpBook: sharpSelect?.value || appConfig.defaultSharpBook,
-        minEdgePercent: numberOrDefault(minEdgeInput?.value, appConfig.defaultMinEdgePercent ?? 1),
-        bankroll: numberOrDefault(bankrollInput?.value, appConfig.defaultBankroll ?? 1000),
-        kellyFraction: numberOrDefault(kellySelect?.value, appConfig.defaultKellyFraction ?? 0.25),
-      });
-    });
-
-    stakeInput.addEventListener('input', () => {
-      if (lastScanData) {
-        renderArbitrage();
-        renderMiddles();
-      }
-    });
-
-    minGapInput.addEventListener('input', () => renderMiddles());
-    positiveEvToggle.addEventListener('change', () => renderMiddles());
-    middleSortSelect.addEventListener('change', () => renderMiddles());
-    minEdgeInput.addEventListener('input', () => renderPlusEv());
-    bankrollInput.addEventListener('input', () => renderPlusEv());
-    kellySelect.addEventListener('change', () => renderPlusEv());
-    plusEvSortSelect.addEventListener('change', () => renderPlusEv());
-
-    async function runScan(payload) {
-      setScanning(true);
-      try {
-        const response = await fetch('/scan', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            apiKey: payload.apiKey,
-            sports: payload.sports,
-            allSports: payload.allSports,
-            stake: payload.stake,
-            regions: payload.regions,
-            commission: payload.commission,
-            sharpBook: payload.sharpBook,
-            minEdgePercent: payload.minEdgePercent,
-            bankroll: payload.bankroll,
-            kellyFraction: payload.kellyFraction,
-          }),
-        });
-        const data = await response.json();
-        if (!data.success) {
-          throw new Error(data.error || 'Scan failed');
-        }
-        if (data?.middles?.defaults) {
-          const defaults = data.middles.defaults;
-          if (defaults.min_gap !== undefined) minGapInput.value = defaults.min_gap;
-          if (defaults.positive_only !== undefined) positiveEvToggle.checked = defaults.positive_only;
-          if (defaults.sort) middleSortSelect.value = defaults.sort;
-        }
-        if (data?.plus_ev?.defaults) {
-          const defaults = data.plus_ev.defaults;
-          if (defaults.sharp_book) sharpSelect.value = defaults.sharp_book;
-          if (defaults.min_edge_percent !== undefined) minEdgeInput.value = defaults.min_edge_percent;
-          if (defaults.bankroll !== undefined) bankrollInput.value = defaults.bankroll;
-          if (defaults.kelly_fraction !== undefined) kellySelect.value = defaults.kelly_fraction;
-        }
-        renderScanData(data);
-        showStatus(`Scan complete at ${new Date(data.scan_time).toLocaleTimeString()}`, 'success');
-      } catch (err) {
-        showStatus(err.message || 'Scan failed', 'error');
-        renderScanData(null);
-      } finally {
-        setScanning(false);
-      }
-    }
-
-    function setScanning(isScanning) {
-      scanBtn.disabled = isScanning;
-      scanBtn.textContent = isScanning ? 'Scanning…' : 'Scan Now';
-      if (isScanning) showStatus('Scanning, please wait…', '');
-    }
-
-    function numberOrDefault(value, fallback) {
-      const number = parseFloat(value);
-      return Number.isFinite(number) ? number : fallback;
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? '').replace(/[&<>"']/g, (char) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-      }[char]));
-    }
-
-    function showStatus(message, type) {
-      statusEl.textContent = message;
-      statusEl.className = `status ${type}`;
-    }
-
-    function renderScanData(payload) {
-      lastScanData = payload;
-      if (payload && typeof payload.commission_rate === 'number') {
-        lastCommissionRate = payload.commission_rate;
-      }
-      renderArbitrage();
-      renderMiddles();
-      renderPlusEv();
-      renderPartialWarning(payload);
-    }
-
-    function renderArbitrage() {
-      const arbData = lastScanData?.arbitrage;
-      const opportunities = arbData?.opportunities || [];
-      const stakeValue = parseFloat(stakeInput.value) || 0;
-      resultsBody.innerHTML = '';
-      tableCount.textContent = `${opportunities.length} results`;
-      if (!opportunities.length) {
-        emptyState.classList.remove('hidden');
-      } else {
-        emptyState.classList.add('hidden');
-        let runningProfit = 0;
-        opportunities.forEach((opp) => {
-          const row = document.createElement('tr');
-          const calcNet = calculateStakes(opp, stakeValue, true);
-          const netRoi = calcNet?.roi_percent ?? opp.roi_percent;
-          row.classList.add(roiBandClass(netRoi));
-          const commence = opp.commence_time ? new Date(opp.commence_time).toLocaleString() : 'TBD';
-          const calcGross = opp.has_exchange ? calculateStakes(opp, stakeValue, false) : null;
-          const grossRoi = opp.has_exchange ? calcGross?.roi_percent ?? opp.gross_roi_percent : null;
-          const netNegative = typeof netRoi === 'number' && netRoi < 0;
-          if (netNegative) row.classList.add('roi-negative');
-          if (opp.has_exchange) row.classList.add('has-exchange');
-          const breakdown = calcNet?.breakdown || [];
-          const profitValue = calcNet?.guaranteed_profit ?? 0;
-          runningProfit += profitValue || 0;
-          const profitClass = profitValue > 0 ? 'gain' : profitValue < 0 ? 'loss' : '';
-          const grossCell = opp.has_exchange ? formatRoiBadge(grossRoi) : '';
-          row.innerHTML = `
-            <td><span class="roi-badge">${formatPercent(netRoi)}</span>${netNegative ? '<span class="roi-warning" title="Net ROI is negative after commission.">⚠</span>' : ''}</td>
-            <td>${grossCell}</td>
-            <td class="profit-cell ${profitClass}">${calcNet ? formatProfit(profitValue) : '-'}</td>
-            <td>${formatExchangeCell(opp)}</td>
-            <td>${escapeHtml(opp.sport_display || opp.sport || '')}</td>
-            <td>${escapeHtml(opp.event || '')}</td>
-            <td>${commence}</td>
-            <td>${formatMarket(opp)}</td>
-            <td>${formatOutcome(breakdown[0])}</td>
-            <td>${formatOutcome(breakdown[1])}</td>`;
-          resultsBody.appendChild(row);
-        });
-        tableCount.textContent = `${opportunities.length} results • ${formatCurrency(runningProfit)} profit`;
-      }
-      const summary = arbData?.summary;
-      if (summary) {
-        statOpps.textContent = arbData.opportunities_count || opportunities.length;
-        statEvents.textContent = summary.events_scanned;
-        statSports.textContent = summary.sports_scanned;
-        statCalls.textContent = summary.api_calls_used;
-        const totalProfit = opportunities.reduce((sum, opp) => {
-          const calc = calculateStakes(opp, parseFloat(stakeInput.value) || stakeValue, true);
-          return sum + (calc?.guaranteed_profit || 0);
-        }, 0);
-        renderBars(summaryROI, summary.by_roi_band, 'roi');
-        renderBars(summarySport, summary.by_sport, 'sport');
-        const totalStaked = stakeValue > 0 ? stakeValue * opportunities.length : 0;
-        const commissionPercent = formatCommissionPercent(lastCommissionRate);
-        const regionsLabel = Array.isArray(lastScanData?.regions) && lastScanData.regions.length
-          ? lastScanData.regions.join(', ').toUpperCase()
-          : '';
-        summaryEl.classList.remove('hidden');
-        summaryEl.innerHTML = `
-          <h3>Summary</h3>
-          <p>Found <strong>${arbData.opportunities_count || opportunities.length}</strong> opportunities across <strong>${summary.events_scanned}</strong> events in <strong>${summary.sports_scanned}</strong> sports.</p>
-          <p>Total potential profit: <strong>${formatCurrency(totalProfit)}</strong>${totalStaked ? ` on ${formatCurrency(totalStaked)} staked` : ''}</p>
-          <p>Odds requests made: ${summary.api_calls_used}${regionsLabel ? ` • Regions: ${regionsLabel}` : ''}</p>
-          <p>Exchange commission applied: ${commissionPercent}.</p>
-          <p class="helper">ROI = return on total stake. 2% ROI means $2 profit on a $100 stake.</p>
-        `;
-      } else {
-        statOpps.textContent = statEvents.textContent = statSports.textContent = statCalls.textContent = '0';
-        summaryROI.innerHTML = '';
-        summarySport.innerHTML = '';
-        summaryEl.classList.add('hidden');
-        summaryEl.innerHTML = '';
-      }
-    }
-
-    function renderMiddles() {
-      const data = lastScanData?.middles;
-      const opportunities = data?.opportunities || [];
-      const minGap = parseFloat(minGapInput.value) || 0;
-      const positiveOnly = positiveEvToggle.checked;
-      const sortKey = middleSortSelect.value || 'ev';
-      const scannedStake = data?.stake_amount || 0;
-      const desiredStake = parseFloat(stakeInput.value) || scannedStake || 100;
-      const stakeRatio = scannedStake > 0 ? desiredStake / scannedStake : 1;
-      const filtered = opportunities.filter((opp) => {
-        const gapPoints = opp.gap?.points ?? 0;
-        if (gapPoints < minGap) return false;
-        if (positiveOnly && opp.ev_percent <= 0) return false;
-        return true;
-      });
-      filtered.sort((a, b) => {
-        switch (sortKey) {
-          case 'probability':
-            return (b.middle_probability || 0) - (a.middle_probability || 0);
-          case 'gap':
-            return (b.gap?.integer_count || 0) - (a.gap?.integer_count || 0);
-          case 'time': {
-            const timeA = a.commence_time ? new Date(a.commence_time).getTime() : 0;
-            const timeB = b.commence_time ? new Date(b.commence_time).getTime() : 0;
-            return timeA - timeB;
-          }
-          case 'ev':
-          default:
-            return (b.ev_percent || 0) - (a.ev_percent || 0);
-        }
-      });
-      const stats = buildMiddleStats(filtered);
-      middleStatCount.textContent = stats.count;
-      middleStatPositive.textContent = stats.positive_count;
-      middleStatAvg.textContent = formatPercent(stats.average_ev_percent);
-      middleStatBest.textContent = formatPercent(stats.best_ev_percent);
-      if (stats.count > 0) {
-        middleSummaryInfo.classList.remove('hidden');
-        const bestText = stats.best_event ? ` • Best: ${escapeHtml(stats.best_event)}` : '';
-        middleSummaryInfo.innerHTML = `
-          <h3>Summary</h3>
-          <p>Middles matching filters: <strong>${stats.count}</strong>, with <strong>${stats.positive_count}</strong> positive EV.</p>
-          <p>Average EV: <strong>${formatPercent(stats.average_ev_percent)}</strong>${bestText}</p>
-        `;
-        renderBars(middleSportBars, stats.by_sport, 'sport');
-        if (Object.keys(stats.key_numbers).length) {
-          middleKeyCard.classList.remove('hidden');
-          renderBars(middleKeyBars, stats.key_numbers, 'sport');
-        } else {
-          middleKeyCard.classList.add('hidden');
-          middleKeyBars.innerHTML = '<p class="muted">Spreads only</p>';
-        }
-      } else {
-        middleSummaryInfo.classList.add('hidden');
-        middleSummaryInfo.innerHTML = '';
-        middleSportBars.innerHTML = '';
-        middleKeyCard.classList.add('hidden');
-        middleKeyBars.innerHTML = '<p class="muted">Spreads only</p>';
-      }
-
-      middlesTableBody.innerHTML = '';
-      middlesTableCount.textContent = `${filtered.length} results`;
-      if (!filtered.length) {
-        middlesEmpty.classList.remove('hidden');
-      } else {
-        middlesEmpty.classList.add('hidden');
-        filtered.forEach((opp) => {
-          const row = document.createElement('tr');
-          const evClass = evBandClass(opp.ev_percent);
-          if (evClass) row.classList.add(evClass);
-          if (opp.has_exchange) row.classList.add('has-exchange');
-          const commence = opp.commence_time ? new Date(opp.commence_time).toLocaleString() : 'TBD';
-          const stakeA = (opp.stakes?.side_a?.stake || 0) * stakeRatio;
-          const stakeB = (opp.stakes?.side_b?.stake || 0) * stakeRatio;
-          const winBoth = (opp.outcomes?.win_both_profit || 0) * stakeRatio;
-          const miss = (opp.outcomes?.typical_miss_profit || 0) * stakeRatio;
-          row.innerHTML = `
-            <td>${formatPercent(opp.ev_percent)}${opp.has_exchange && typeof opp.gross_ev_percent === 'number' ? `<span class="ev-gross">Gross ${formatPercent(opp.gross_ev_percent)}</span>` : ''}</td>
-            <td>${formatPercent(opp.probability_percent)}</td>
-            <td>${formatGapCell(opp)}</td>
-            <td>${escapeHtml(opp.sport_display || opp.sport || '')}</td>
-            <td>${escapeHtml(opp.event || '')}</td>
-            <td>${commence}</td>
-            <td>${escapeHtml(opp.market || '')}</td>
-            <td>${formatMiddleSide(opp.side_a, stakeA)}</td>
-            <td>${formatMiddleSide(opp.side_b, stakeB)}</td>
-            <td>${escapeHtml(opp.middle_zone || '')}</td>
-            <td class="profit-cell">${formatProfit(winBoth)}</td>
-            <td class="profit-cell">${formatProfit(miss)}</td>
-          `;
-          middlesTableBody.appendChild(row);
-        });
-      }
-    }
-
-    function renderPlusEv() {
-      const plusData = lastScanData?.plus_ev;
-      const opportunities = plusData?.opportunities || [];
-      const minEdge = numberOrDefault(minEdgeInput.value, appConfig.defaultMinEdgePercent ?? 1);
-      const bankroll = numberOrDefault(bankrollInput.value, appConfig.defaultBankroll ?? 1000);
-      const kellyFraction = numberOrDefault(kellySelect.value, appConfig.defaultKellyFraction ?? 0.25);
-      const sortKey = plusEvSortSelect.value || 'edge';
-      const filtered = opportunities.filter((opp) => (opp.edge_percent || 0) >= minEdge);
-      filtered.sort((a, b) => {
-        switch (sortKey) {
-          case 'ev':
-            return (b.ev_per_100 || 0) - (a.ev_per_100 || 0);
-          case 'kelly': {
-            const bkA = calculateKellyStake(oppTrueProb(a), oppEffectiveOdds(a), bankroll, kellyFraction);
-            const bkB = calculateKellyStake(oppTrueProb(b), oppEffectiveOdds(b), bankroll, kellyFraction);
-            return bkB.recommended - bkA.recommended;
-          }
-          case 'time': {
-            const timeA = a.commence_time ? new Date(a.commence_time).getTime() : 0;
-            const timeB = b.commence_time ? new Date(b.commence_time).getTime() : 0;
-            return timeA - timeB;
-          }
-          case 'edge':
-          default:
-            return (b.edge_percent || 0) - (a.edge_percent || 0);
-        }
-      });
-      const stats = buildPlusEvStats(filtered);
-      plusEvCount.textContent = stats.count;
-      plusEvAvg.textContent = formatPercent(stats.average_edge_percent);
-      plusEvBest.textContent = formatPercent(stats.best_edge_percent);
-      plusEvTotal.textContent = formatCurrency(stats.total_ev_per_100);
-      if (stats.count > 0) {
-        plusEvSummaryInfo.classList.remove('hidden');
-        const bestText = stats.best_event ? `Best: ${escapeHtml(stats.best_event)}` : '';
-        plusEvSummaryInfo.innerHTML = `
-          <h3>Summary</h3>
-          <p>+EV bets: <strong>${stats.count}</strong> • Average edge <strong>${formatPercent(stats.average_edge_percent)}</strong> • ${bestText}</p>
-        `;
-        renderBars(plusEvSportBars, stats.by_sport, 'sport');
-        renderBars(plusEvEdgeBars, stats.by_edge_band, 'roi');
-      } else {
-        plusEvSummaryInfo.classList.add('hidden');
-        plusEvSummaryInfo.innerHTML = '';
-        plusEvSportBars.innerHTML = '<p class="muted">No data</p>';
-        plusEvEdgeBars.innerHTML = '<p class="muted">No data</p>';
-      }
-
-      plusEvTableBody.innerHTML = '';
-      plusEvTableCount.textContent = `${filtered.length} results`;
-      if (!filtered.length) {
-        plusEvEmpty.classList.remove('hidden');
-        return;
-      }
-      plusEvEmpty.classList.add('hidden');
-      filtered.forEach((opp) => {
-        const row = document.createElement('tr');
-        if (opp.has_exchange) row.classList.add('has-exchange');
-        const commence = opp.commence_time ? new Date(opp.commence_time).toLocaleString() : 'TBD';
-        const kellyData = calculateKellyStake(oppTrueProb(opp), oppEffectiveOdds(opp), bankroll, kellyFraction);
-        row.innerHTML = `
-          <td>${formatEdgeCell(opp)}</td>
-          <td class="profit-cell">${formatProfit(opp.ev_per_100 || 0)}</td>
-          <td>${formatKellyCell(kellyData)}</td>
-          <td>${escapeHtml(opp.sport_display || opp.sport || '')}</td>
-          <td>${escapeHtml(opp.event || '')}</td>
-          <td>${commence}</td>
-          <td>${formatPlusMarket(opp)}</td>
-          <td>${formatPlusBet(opp)}</td>
-          <td>${formatOddsDisplay(opp.bet?.soft_odds)}</td>
-          <td>${formatOddsDisplay(opp.sharp?.fair_odds)}</td>
-          <td>${formatPercent(opp.sharp?.true_probability_percent)}</td>
-        `;
-        plusEvTableBody.appendChild(row);
-      });
-    }
-
-    function oppTrueProb(opp) {
-      return opp?.sharp?.true_probability ?? (opp?.sharp?.true_probability_percent || 0) / 100;
-    }
-
-    function oppEffectiveOdds(opp) {
-      return opp?.bet?.effective_odds || opp?.bet?.soft_odds || 0;
-    }
-
-    function calculateKellyStake(prob, odds, bankroll, fraction) {
-      if (!prob || !odds || bankroll <= 0) return { fullPercent: 0, fractionPercent: 0, recommended: 0 };
-      const p = Math.max(0, Math.min(prob, 1));
-      const q = 1 - p;
-      const b = odds - 1;
-      if (b <= 0) return { fullPercent: 0, fractionPercent: 0, recommended: 0 };
-      let full = (b * p - q) / b;
-      if (full <= 0) return { fullPercent: 0, fractionPercent: 0, recommended: 0 };
-      const frac = Math.max(0, Math.min(fraction, 1));
-      const adjusted = full * frac;
-      const recommended = Math.max(0, bankroll * adjusted);
-      return {
-        fullPercent: full * 100,
-        fractionPercent: adjusted * 100,
-        recommended: Number(recommended.toFixed(2)),
-      };
-    }
-
-    function formatEdgeCell(opp) {
-      const net = formatPercent(opp.edge_percent);
-      if (opp.has_exchange && typeof opp.gross_edge_percent === 'number' && opp.gross_edge_percent !== opp.edge_percent) {
-        return `${net}<span class="ev-gross">Gross ${formatPercent(opp.gross_edge_percent)}</span>`;
-      }
-      return net;
-    }
-
-    function formatKellyCell(kellyData) {
-      if (!kellyData) return '';
-      const stake = kellyData.recommended || 0;
-      const frac = kellyData.fractionPercent || 0;
-      return `<div class="kelly-cell">${formatCurrency(stake)}<span class="mono">${frac.toFixed(2)}% roll</span></div>`;
-    }
-
-    function formatPlusMarket(opp) {
-      if (!opp) return '';
-      if ((opp.market === 'spreads' || opp.market === 'totals') && opp.market_point !== undefined && opp.market_point !== null) {
-        return `${escapeHtml(opp.market)} (${formatLine(opp.market_point)})`;
-      }
-      return escapeHtml(opp.market || '');
-    }
-
-    function formatPlusBet(opp) {
-      if (!opp?.bet) return '';
-      const exchangeBadge = opp.bet.is_exchange ? '<span class="exchange-badge">Exchange</span>' : '';
-      const book = opp.bet.soft_book ? ` @ ${escapeHtml(opp.bet.soft_book)}` : '';
-      const point = opp.bet.point !== undefined && opp.bet.point !== null ? ` (${formatLine(opp.bet.point)})` : '';
-      return `<span class="outcome">${exchangeBadge}<strong>${escapeHtml(opp.bet.outcome || '')}${point}</strong><span>${book}</span></span>`;
-    }
-
-    function updateOddsToggle() {
-      if (!oddsToggle) return;
-      oddsToggle.querySelectorAll('span').forEach((span) => {
-        const format = span.dataset.format;
-        span.classList.toggle('active', format === oddsFormat);
-      });
-    }
-
-    function formatOddsDisplay(value) {
-      if (!value && value !== 0) return '-';
-      if (oddsFormat === 'american') {
-        const american = decimalToAmerican(value);
-        return american > 0 ? `+${american}` : `${american}`;
-      }
-      return Number(value).toFixed(2);
-    }
-
-    function decimalToAmerican(decimal) {
-      if (!decimal || decimal <= 1) return 0;
-      if (decimal >= 2) {
-        return Math.round((decimal - 1) * 100);
-      }
-      return Math.round(-100 / (decimal - 1));
-    }
-
-    function formatOutcome(item) {
-      if (!item) return '';
-      const point = item.point !== undefined && item.point !== null ? ` (${escapeHtml(item.point)})` : '';
-      const stake = item.stake !== undefined ? formatCurrency(item.stake) : '';
-      const book = item.bookmaker ? ` @ ${escapeHtml(item.bookmaker)}` : '';
-      const exchangeBadge = item.is_exchange ? '<span class="exchange-badge">Exchange</span>' : '';
-      const effectiveNote =
-        item.is_exchange && item.effective_price && item.effective_price !== item.price
-          ? `<span class="mono net-note">Net @ ${formatOddsDisplay(item.effective_price)}</span>`
-          : '';
-      return `<span class="outcome">${exchangeBadge}<strong>${escapeHtml(item.outcome || '')}${point}</strong><span>${stake}${book}</span><span class="mono">@ ${formatOddsDisplay(item.price)}</span>${effectiveNote}</span>`;
-    }
-
-    function formatMarket(opp) {
-      if (opp.market === 'spreads' || opp.market === 'totals') {
-        const point = opp.best_odds?.[0]?.point ?? opp.point;
-        if (point !== undefined && point !== null) {
-          return `${escapeHtml(opp.market)} (${escapeHtml(point)})`;
-        }
-      }
-      return escapeHtml(opp.market || '');
-    }
-
-    function formatPrice(value) {
-      if (!value && value !== 0) return '';
-      return Number(value).toFixed(2);
-    }
-
-    function calculateStakes(opp, totalStake, useEffectivePrices = true) {
-      const odds = (opp.best_odds || []).slice(0, 2);
-      if (!totalStake || totalStake <= 0 || odds.length < 2) return null;
-      const inverses = odds.map((o) => {
-        if (!o) return 0;
-        const price = useEffectivePrices
-          ? Number(o.effective_price ?? o.price)
-          : Number(o.price);
-        return price > 0 ? 1 / price : 0;
-      });
-      const sumInv = inverses.reduce((a, b) => a + b, 0);
-      if (sumInv <= 0) return null;
-      let allocated = 0;
-      const breakdown = odds.map((o, idx) => {
-        if (!o || !o.price) return null;
-        const fraction = inverses[idx] / sumInv;
-        const stake = idx === odds.length - 1
-          ? Number((totalStake - allocated).toFixed(2))
-          : Number((totalStake * fraction).toFixed(2));
-        allocated += stake;
-        const displayPrice = Number(o.price);
-        const effectivePrice = Number(o.effective_price ?? o.price);
-        const priceUsed = useEffectivePrices ? effectivePrice : displayPrice;
-        if (!priceUsed || priceUsed <= 0) return null;
-        const payout = Number((stake * priceUsed).toFixed(2));
-        return {
-          outcome: o.outcome,
-          bookmaker: o.bookmaker,
-          price: displayPrice,
-          effective_price: effectivePrice,
-          point: o.point,
-          stake,
-          payout,
-          fraction,
-          is_exchange: Boolean(o.is_exchange),
-        };
-      });
-      if (breakdown.includes(null)) return null;
-      const minPayout = Math.min(...breakdown.map((b) => b.payout));
-      const guaranteed_profit = Number((minPayout - totalStake).toFixed(2));
-      const roi_percent = totalStake ? (guaranteed_profit / totalStake) * 100 : 0;
-      return { breakdown, guaranteed_profit, roi_percent };
-    }
-
-    function formatCurrency(value) {
-      return currencyFormatter.format(value || 0);
-    }
-
-    function formatProfit(value) {
-      const formatted = formatCurrency(Math.abs(value || 0));
-      return `${value >= 0 ? '+' : '-'}${formatted}`;
-    }
-
-    function renderPartialWarning(data) {
-      if (data && data.partial && Array.isArray(data.sport_errors) && data.sport_errors.length) {
-        const details = data.sport_errors
-          .map((err) => `${err.sport || err.sport_key || 'Unknown'} (${err.error || 'Unknown error'})`)
-          .join(', ');
-        partialWarning.innerHTML = `<strong>Partial results:</strong> Failed to fetch odds for ${escapeHtml(details)}.`;
-        partialWarning.classList.remove('hidden');
-      } else {
-        partialWarning.classList.add('hidden');
-        partialWarning.textContent = '';
-      }
-    }
-
-    function formatCommissionPercent(rate) {
-      if (typeof rate !== 'number') return `${defaultCommissionPercent.toFixed(1)}%`;
-      const percent = (rate * 100).toFixed(2);
-      return `${percent.replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')}%`;
-    }
-
-    function formatExchangeCell(opp) {
-      if (!opp || !opp.has_exchange) return '<span class="exchange-flag none">No</span>';
-      const names = Array.isArray(opp.exchange_books) && opp.exchange_books.length
-        ? opp.exchange_books.join(', ')
-        : 'Exchange';
-      const commissionText = formatCommissionPercent(lastCommissionRate);
-      return `<span class="exchange-flag">${escapeHtml(names)}<span class="exchange-note">${commissionText}</span></span>`;
-    }
-
-    function setActiveTab(tab) {
-      activeTab = tab;
-      tabs.forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tab));
-      arbitragePanel.classList.toggle('hidden', tab !== 'arbitrage');
-      middlesPanel.classList.toggle('hidden', tab !== 'middles');
-      plusEvPanel.classList.toggle('hidden', tab !== 'plus-ev');
-      middlesConfig.classList.toggle('hidden', tab !== 'middles');
-      plusEvConfig.classList.toggle('hidden', tab !== 'plus-ev');
-      if (tab === 'arbitrage') {
-        renderArbitrage();
-      } else if (tab === 'middles') {
-        renderMiddles();
-      } else {
-        renderPlusEv();
-      }
-    }
-
-    function formatGapCell(opp) {
-      const integers = opp.gap?.middle_integers || [];
-      const keyFlag = opp.gap?.includes_key_number ? ' 🏈' : '';
-      const points = typeof opp.gap?.points === 'number' ? `${opp.gap.points.toFixed(1)} pts` : '';
-      let range = '';
-      if (integers.length) {
-        range = integers.length === 1 ? `${integers[0]}` : `${integers[0]}-${integers[integers.length - 1]}`;
-      }
-      const pieces = [range, points].filter(Boolean);
-      return `${escapeHtml(pieces.join(' · '))}${keyFlag}`;
-    }
-
-    function formatMiddleSide(side, stakeValue) {
-      if (!side) return '';
-      const line = side.line !== undefined && side.line !== null ? formatLine(side.line) : '';
-      const book = side.bookmaker ? ` @ ${escapeHtml(side.bookmaker)}` : '';
-      const odds = side.effective_price ? formatOddsDisplay(side.effective_price) : formatOddsDisplay(side.price);
-      const stake = stakeValue ? `Stake: ${formatCurrency(stakeValue)}` : '';
-      const exchangeBadge = side.is_exchange ? '<span class="exchange-badge">Exchange</span>' : '';
-      return `<span class="outcome">${exchangeBadge}<strong>${escapeHtml(side.team || '')} ${line}</strong><span>Odds: ${odds}${book}</span><span>${stake}</span></span>`;
-    }
-
-    function formatLine(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) return '';
-      const num = Number(value);
-      const sign = num > 0 ? '+' : '';
-      return `${sign}${num.toFixed(1)}`;
-    }
-
-    function roiBandClass(roi) {
-      if (roi >= 2) return 'band-hot';
-      if (roi >= 1) return 'band-warm';
-      return 'band-cool';
-    }
-
-    function renderBars(container, data, type) {
-      if (!data || Object.keys(data).length === 0) {
-        container.innerHTML = '<p class="muted">No data</p>';
-        return;
-      }
-      const entries = Object.entries(data).sort((a, b) => b[1] - a[1]);
-      const max = entries[0][1] || 1;
-      container.innerHTML = entries
-        .map(([label, value]) => {
-          const width = Math.max((value / max) * 100, 8);
-          const bandClass = type === 'roi' ? roiBandLabelClass(label) : '';
-          return `
-            <div class="bar-row">
-              <span>${escapeHtml(label)}</span>
-              <div class="bar-track">
-                <div class="bar-fill ${bandClass}" style="width: ${width}%"></div>
-              </div>
-              <span class="bar-value">${escapeHtml(value)}</span>
-            </div>`;
-        })
-        .join('');
-    }
-
-    function roiBandLabelClass(label) {
-      if (label.includes('10')) return 'band-hot';
-      if (label.includes('5')) return 'band-warm';
-      return 'band-cool';
-    }
-
-    function formatPercent(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) return '-';
-      return `${Number(value).toFixed(2)}%`;
-    }
-
-    function formatRoiBadge(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) return '';
-      return `<span class="roi-badge secondary">${formatPercent(value)}</span>`;
-    }
-
-    function evBandClass(evPercent) {
-      if (evPercent >= 10) return 'ev-hot';
-      if (evPercent >= 5) return 'ev-warm';
-      if (evPercent >= 1) return 'ev-cool';
-      if (evPercent < 0) return 'ev-negative';
-      return '';
-    }
-
-    function buildMiddleStats(list) {
-      const count = list.length;
-      if (!count) {
-        return {
-          count: 0,
-          positive_count: 0,
-          average_ev_percent: 0,
-          best_ev_percent: 0,
-          best_event: '',
-          by_sport: {},
-          key_numbers: {},
-        };
-      }
-      let positive = 0;
-      let evSum = 0;
-      let best = list[0];
-      const bySport = {};
-      const keyNumbers = {};
-      list.forEach((opp) => {
-        const ev = Number(opp.ev_percent) || 0;
-        if (ev > 0) positive += 1;
-        evSum += ev;
-        if (!best || ev > (best.ev_percent || 0)) {
-          best = opp;
-        }
-        const sport = opp.sport_display || opp.sport || 'Other';
-        bySport[sport] = (bySport[sport] || 0) + 1;
-        (opp.gap?.key_numbers_crossed || []).forEach((num) => {
-          const key = String(num);
-          keyNumbers[key] = (keyNumbers[key] || 0) + 1;
-        });
-      });
-      return {
-        count,
-        positive_count: positive,
-        average_ev_percent: evSum / count,
-        best_ev_percent: best?.ev_percent || 0,
-        best_event: best?.event || '',
-        by_sport: bySport,
-        key_numbers: keyNumbers,
-      };
-    }
-
-    function buildPlusEvStats(list) {
-      const count = list.length;
-      if (!count) {
-        return {
-          count: 0,
-          average_edge_percent: 0,
-          best_edge_percent: 0,
-          best_event: '',
-          total_ev_per_100: 0,
-          by_sport: {},
-          by_edge_band: {},
-        };
-      }
-      let edgeSum = 0;
-      let best = list[0];
-      let totalEv = 0;
-      const bySport = {};
-      const byEdge = {};
-      list.forEach((opp) => {
-        const edge = Number(opp.edge_percent) || 0;
-        edgeSum += edge;
-        totalEv += Number(opp.ev_per_100) || 0;
-        if (!best || edge > (best.edge_percent || 0)) best = opp;
-        const sport = opp.sport_display || opp.sport || 'Other';
-        bySport[sport] = (bySport[sport] || 0) + 1;
-        const bandLabel = edge >= 10 ? '10%+' : edge >= 5 ? '5-10%' : edge >= 3 ? '3-5%' : '1-3%';
-        byEdge[bandLabel] = (byEdge[bandLabel] || 0) + 1;
-      });
-      return {
-        count,
-        average_edge_percent: edgeSum / count,
-        best_edge_percent: best?.edge_percent || 0,
-        best_event: best?.event || '',
-        total_ev_per_100: totalEv,
-        by_sport: bySport,
-        by_edge_band: byEdge,
-      };
-    }
-  </script>
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
 </html>

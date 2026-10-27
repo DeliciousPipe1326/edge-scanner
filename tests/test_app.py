@@ -17,6 +17,13 @@ class AppTests(unittest.TestCase):
         self.assertIn(b"Edge Scanner", response.data)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
+    def test_environment_key_is_never_rendered_into_the_page(self):
+        with patch.object(web, "ENV_API_KEY", "private-test-key-do-not-render"):
+            response = self.client.get("/")
+        self.assertNotIn(b"private-test-key-do-not-render", response.data)
+        self.assertIn(b'"hasEnvKey": true', response.data)
+        self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
+
     @patch("app.run_scan", return_value={"success": True})
     def test_valid_scan_preserves_zero_settings(self, scan):
         response = self.client.post(

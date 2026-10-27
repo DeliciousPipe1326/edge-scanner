@@ -1,4 +1,5 @@
 import unittest
+import datetime as dt
 from unittest.mock import Mock, patch
 
 import requests
@@ -8,6 +9,7 @@ import scanner
 
 def book(key, outcomes, market="h2h"):
     return {
+        "last_update": dt.datetime.now(dt.timezone.utc).isoformat(),
         "key": key,
         "title": key.replace("_", " ").title(),
         "markets": [{"key": market, "outcomes": outcomes}],
@@ -23,6 +25,8 @@ def outcome(name, price, point=None):
 
 def game(*books):
     return {
+        "id": "fixture-event",
+        "commence_time": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat(),
         "home_team": "Home",
         "away_team": "Away",
         "sport_key": "basketball_nba",
@@ -84,13 +88,17 @@ class ScannerTests(unittest.TestCase):
         profits = scanner._calculate_middle_outcomes(a, b, 3, 2)
         self.assertEqual(profits["side_a_wins_profit"], profits["side_b_wins_profit"])
 
-    def test_football_key_number_weights_only_apply_to_spreads(self):
-        self.assertAlmostEqual(
-            scanner._estimate_middle_probability([3], "americanfootball_nfl", "totals"), 0.03
+    def test_middle_uses_payoffs_and_break_even_instead_of_invented_probability(self):
+        event = game(
+            book("a", [outcome("Home", 1.9, -2.5), outcome("Away", 1.9, 2.5)], "spreads"),
+            book("b", [outcome("Home", 1.9, -3.5), outcome("Away", 1.9, 3.5)], "spreads"),
         )
-        self.assertAlmostEqual(
-            scanner._estimate_middle_probability([3], "americanfootball_nfl", "spreads"), 0.15
-        )
+        entries = scanner._collect_middle_opportunities(event, "spreads", 100, 0)
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0]["middle_probability"])
+        self.assertIsNone(entries[0]["ev_percent"])
+        self.assertAlmostEqual(entries[0]["break_even_percent"], 5.26, places=2)
+        self.assertEqual(entries[0]["profile"]["worst_case_profit"], -5)
 
     def test_rounded_stakes_sum_to_total(self):
         offers = [
