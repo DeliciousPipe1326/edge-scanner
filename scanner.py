@@ -10,6 +10,17 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
 
+from quality import (
+    DEFAULT_MAX_AGE,
+    UTC,
+    execution_check,
+    quote_metadata,
+    usable_game,
+    current_opportunities,
+)
+from quota import Quota
+from middles import middle_profile
+
 from config import (
     DEFAULT_BANKROLL,
     DEFAULT_COMMISSION,
@@ -21,17 +32,13 @@ from config import (
     EDGE_BANDS,
     EXCHANGE_BOOKMAKERS,
     EXCHANGE_KEYS,
-    KEY_NUMBER_SPORTS,
-    MAX_MIDDLE_PROBABILITY,
     MIN_EDGE_PERCENT,
     MIN_MIDDLE_GAP,
-    NFL_KEY_NUMBER_PROBABILITY,
-    PROBABILITY_PER_INTEGER,
+    MAX_REFERENCE_MARGIN_PERCENT,
     REGION_CONFIG,
     ROI_BANDS,
     SHARP_BOOKS,
     SHOW_POSITIVE_EV_ONLY,
-    SOFT_BOOK_KEYS,
     SPORT_DISPLAY_NAMES,
     markets_for_sport,
 )
@@ -39,16 +46,22 @@ from config import (
 BASE_URL = "https://api.the-odds-api.com/v4"
 MIDDLE_MARKETS = {"spreads", "totals"}
 ALLOWED_PLUS_EV_MARKETS = {"h2h", "spreads", "totals"}
-SOFT_BOOK_KEY_SET = set(SOFT_BOOK_KEYS)
 SHARP_BOOK_MAP = {book["key"]: book for book in SHARP_BOOKS}
 
 
 class ScannerError(Exception):
     """Raised for recoverable scanner issues."""
 
+    def __init__(self, message, status_code=502):
+        super().__init__(message)
+        self.status_code = status_code
+        self.fatal = status_code in {401, 403, 429}
+
 
 def _iso_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
 
 
 def _valid_price(value) -> Optional[float]:
@@ -123,12 +136,12 @@ def _points_match(point_a, point_b, tolerance: float = 1e-6) -> bool:
 def _spread_gap_info(favorite_line: float, underdog_line: float) -> Optional[dict]:
     if favorite_line is None or underdog_line is None:
         return None
-    if favorite_line >= 0 or underdog_line <= 0:
-        return None
-    fav_abs = abs(favorite_line)
+    fav_abs = -favorite_line
     if fav_abs >= underdog_line:
         return None
     gap = round(underdog_line - fav_abs, 2)
+    if gap > 1000:
+        return None
     start = math.floor(fav_abs) + 1
     end = math.ceil(underdog_line) - 1
     if end < start:
@@ -149,6 +162,8 @@ def _total_gap_info(over_line: float, under_line: float) -> Optional[dict]:
     if over_line >= under_line:
         return None
     gap = under_line - over_line
+    if gap > 1000:
+        return None
     lower = math.floor(over_line) + 1
     upper = math.ceil(under_line) - 1
     if upper < lower:
@@ -164,7 +179,10 @@ def _total_gap_info(over_line: float, under_line: float) -> Optional[dict]:
 
 
 def _build_sharp_reference(
-    bookmaker: dict, commission_rate: float, is_exchange: bool
+    bookmaker: dict,
+    commission_rate: float,
+    is_exchange: bool,
+    diagnostics: Optional[dict] = None,
 ) -> Dict[Tuple[str, str], dict]:
     """Return mapping of (market_key, line_key) to vig-free odds."""
     line_map: Dict[Tuple[str, str], List[dict]] = {}
@@ -186,6 +204,7 @@ def _build_sharp_reference(
             adjusted_price = _apply_commission(price_val, commission_rate, is_exchange)
             line_map.setdefault((market_key, line_key), []).append(
                 {
+                    **quote_metadata(bookmaker, market, outcome),
                     "name": (outcome.get("name") or "").strip().lower(),
                     "display_name": outcome.get("name") or "",
                     "price": adjusted_price,
@@ -198,6 +217,20 @@ def _build_sharp_reference(
         if len(entries) != 2:
             continue
         first, second = entries
+        margin = (1 / first["price"] + 1 / second["price"] - 1) * 100
+        limits = [entry.get("bet_limit") for entry in entries]
+        if abs(margin) > MAX_REFERENCE_MARGIN_PERCENT or (
+            is_exchange
+            and any(
+                not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0
+                for limit in limits
+            )
+        ):
+            if diagnostics is not None:
+                diagnostics["rejected_reference_lines"] = (
+                    diagnostics.get("rejected_reference_lines", 0) + 1
+                )
+            continue
         fair_a, fair_b, vig_percent = _remove_vig(first["price"], second["price"])
         prob_a = 1 / fair_a if fair_a else 0.0
         prob_b = 1 / fair_b if fair_b else 0.0
@@ -212,6 +245,7 @@ def _build_sharp_reference(
                     "opponent_name": second["display_name"],
                     "display_name": first["display_name"],
                     "point": first.get("point"),
+                    "last_update": first.get("last_update"),
                 },
                 second["name"]: {
                     "fair_odds": fair_b,
@@ -221,6 +255,7 @@ def _build_sharp_reference(
                     "opponent_name": first["display_name"],
                     "display_name": second["display_name"],
                     "point": second.get("point"),
+                    "last_update": second.get("last_update"),
                 },
             },
         }
@@ -246,6 +281,7 @@ def _two_way_outcomes(bookmaker: dict) -> Dict[Tuple[str, str], List[dict]]:
                 continue
             line_map.setdefault((market_key, line_key), []).append(
                 {
+                    **quote_metadata(bookmaker, market, outcome),
                     "name": (outcome.get("name") or "").strip().lower(),
                     "display_name": outcome.get("name") or "",
                     "price": display_price,
@@ -255,25 +291,9 @@ def _two_way_outcomes(bookmaker: dict) -> Dict[Tuple[str, str], List[dict]]:
     return {key: entries for key, entries in line_map.items() if len(entries) == 2}
 
 
-def _estimate_middle_probability(
-    middle_integers: List[int], sport_key: str, market_key: str
-) -> float:
-    if not middle_integers:
-        return 0.0
-    lookup_key = f"{sport_key}_{market_key}"
-    base_prob = PROBABILITY_PER_INTEGER.get(lookup_key, PROBABILITY_PER_INTEGER["default"])
-    total = 0.0
-    is_key_sport = sport_key in KEY_NUMBER_SPORTS and market_key == "spreads"
-    for integer in middle_integers:
-        abs_int = abs(integer)
-        if is_key_sport and abs_int in NFL_KEY_NUMBER_PROBABILITY:
-            total += NFL_KEY_NUMBER_PROBABILITY[abs_int]
-        else:
-            total += base_prob
-    return min(total, MAX_MIDDLE_PROBABILITY)
-
-
-def _calculate_middle_stakes(odds_a: float, odds_b: float, total_stake: float) -> Tuple[float, float]:
+def _calculate_middle_stakes(
+    odds_a: float, odds_b: float, total_stake: float
+) -> Tuple[float, float]:
     if total_stake <= 0 or odds_a <= 1 or odds_b <= 1:
         return 0.0, 0.0
     # Equalize the payouts when only one side wins, including the lost stake.
@@ -301,73 +321,80 @@ def _calculate_middle_outcomes(
     }
 
 
-def _calculate_middle_ev(
-    win_both_profit: float,
-    side_a_profit: float,
-    side_b_profit: float,
-    probability: float,
-) -> float:
-    probability = max(0.0, min(probability, 1.0))
-    miss_probability = 1.0 - probability
-    miss_ev = 0.5 * side_a_profit + 0.5 * side_b_profit
-    value = (probability * win_both_profit) + (miss_probability * miss_ev)
-    return round(value, 2)
-
-
-def _format_middle_zone(
-    description_source: str, middle_integers: List[int], is_total: bool
-) -> str:
+def _format_middle_zone(description_source: str, middle_integers: List[int], is_total: bool) -> str:
     if not middle_integers:
         return description_source
     middle_integers = sorted(middle_integers)
     if len(middle_integers) == 1:
         range_text = str(middle_integers[0])
     else:
-        range_text = f"{middle_integers[0]}-{middle_integers[-1]}"
+        range_text = f"{middle_integers[0]} to {middle_integers[-1]}"
     if is_total:
         return f"Total {range_text}"
-    return f"{description_source} by {range_text}"
+    return f"{description_source}: {range_text}"
 
 
-def _request(url: str, params: Dict[str, str]) -> requests.Response:
+def _request(url: str, params: Dict[str, str], quota: Optional[Quota] = None) -> requests.Response:
     try:
-        resp = requests.get(url, params=params, timeout=30)
-    except requests.RequestException as exc:  # pragma: no cover - network error
+        resp = requests.get(url, params=params, timeout=(5, 30), allow_redirects=False)
+    except requests.RequestException as exc:
+        if quota is not None:
+            quota.complete = False
         # Request exceptions can contain the full URL, including the API key.
         raise ScannerError("Could not reach The Odds API. Please try again.") from exc
+    if quota is not None:
+        quota.record(resp.headers, paid="/odds/" in url)
+    if 300 <= resp.status_code < 400:
+        raise ScannerError("Unexpected redirect from The Odds API")
     if resp.status_code >= 400:
         try:
             payload = resp.json()
-            message = (payload.get("message") or payload.get("error")) if isinstance(payload, dict) else None
+            message = (
+                (payload.get("message") or payload.get("error"))
+                if isinstance(payload, dict)
+                else None
+            )
         except ValueError:
             message = None
         message = str(message or f"API request failed ({resp.status_code})")
         if params.get("apiKey"):
             message = message.replace(params["apiKey"], "[redacted]")
-        raise ScannerError(message)
+        raise ScannerError(message, status_code=resp.status_code)
     return resp
 
 
-def fetch_sports(api_key: str) -> List[dict]:
+def fetch_sports(api_key: str, quota: Optional[Quota] = None) -> List[dict]:
     url = f"{BASE_URL}/sports/"
-    resp = _request(url, {"apiKey": api_key})
+    resp = _request(url, {"apiKey": api_key}, quota)
     try:
         return _parse_list_response(resp, "sports list")
     except ValueError as exc:  # pragma: no cover - malformed payload
         raise ScannerError("Failed to parse sports list") from exc
 
 
-def filter_sports(
-    sports: Sequence[dict], requested: Sequence[str], all_sports: bool
-) -> List[dict]:
-    if all_sports:
-        return [s for s in sports if s.get("active") and not s.get("has_outrights")]
+def filter_sports(sports: Sequence[dict], requested: Sequence[str], all_sports: bool) -> List[dict]:
     requested_set = set(requested) if requested else set(DEFAULT_SPORT_KEYS)
-    return [s for s in sports if s.get("key") in requested_set and s.get("active")]
+    selected = {}
+    for sport in sports:
+        key = sport.get("key")
+        if (
+            isinstance(key, str)
+            and key
+            and sport.get("active")
+            and not sport.get("has_outrights")
+            and (all_sports or key in requested_set)
+        ):
+            selected[key] = sport
+    return list(selected.values())
 
 
 def fetch_odds_for_sport(
-    api_key: str, sport_key: str, markets: Sequence[str], regions: Sequence[str]
+    api_key: str,
+    sport_key: str,
+    markets: Sequence[str],
+    regions: Sequence[str],
+    quota: Optional[Quota] = None,
+    window_hours: Optional[int] = 24,
 ) -> List[dict]:
     url = f"{BASE_URL}/sports/{sport_key}/odds/"
     params = {
@@ -375,9 +402,13 @@ def fetch_odds_for_sport(
         "regions": ",".join(regions),
         "markets": ",".join(markets),
         "oddsFormat": "decimal",
+        "includeBetLimits": "true",
         "commenceTimeFrom": _iso_now(),
     }
-    resp = _request(url, params)
+    if window_hours is not None:
+        end = dt.datetime.now(UTC) + dt.timedelta(hours=window_hours)
+        params["commenceTimeTo"] = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    resp = _request(url, params, quota)
     try:
         return _parse_list_response(resp, f"odds for {sport_key}")
     except ValueError as exc:  # pragma: no cover
@@ -416,7 +447,11 @@ def _line_key(market: str, outcome: dict) -> Optional[str]:
 
 
 def _record_best_prices(
-    markets: List[dict], market_key: str, commission_rate: float, home_team: Optional[str] = None
+    markets: List[dict],
+    market_key: str,
+    commission_rate: float,
+    home_team: Optional[str] = None,
+    stake_total: Optional[float] = None,
 ) -> LineMap:
     lines: LineMap = {}
     for book in markets:
@@ -439,12 +474,12 @@ def _record_best_prices(
                     key = f"spread_{home_point:.6f}"
                 entry = lines.setdefault(key, {})
                 name = outcome.get("name", "")
-                existing = entry.get(name)
                 display_price = float(price)
                 is_exchange = bookmaker_key in EXCHANGE_KEYS
                 effective_price = _apply_commission(display_price, commission_rate, is_exchange)
-                if not existing or effective_price > existing["effective_price"]:
-                    entry[name] = {
+                entry.setdefault(name, []).append(
+                    {
+                        **quote_metadata(book, market, outcome),
                         "effective_price": effective_price,
                         "display_price": display_price,
                         "bookmaker": bookmaker,
@@ -453,7 +488,25 @@ def _record_best_prices(
                         "point": normalized_point,
                         "is_exchange": is_exchange,
                     }
-    return lines
+                )
+    selected = {}
+    for key, offers in lines.items():
+        if len(offers) != 2 or stake_total is None:
+            selected[key] = {
+                name: max(items, key=lambda o: o["effective_price"])
+                for name, items in offers.items()
+            }
+            continue
+        names = list(offers)
+        best, best_roi = None, float("-inf")
+        for pair in itertools.product(*(offers[name] for name in names)):
+            stakes = _calculate_stakes(list(pair), stake_total, "effective_price")
+            check = execution_check(pair, [o["stake"] for o in stakes["breakdown"]])
+            if not check["exceeds_limit"] and stakes["roi_percent"] > best_roi:
+                best, best_roi = pair, stakes["roi_percent"]
+        if best:
+            selected[key] = dict(zip(names, best))
+    return selected
 
 
 def _collect_market_entries(
@@ -468,7 +521,9 @@ def _collect_market_entries(
         }
         for book in bookmakers
     ]
-    best_lines = _record_best_prices(markets, market_key, commission_rate, game.get("home_team"))
+    best_lines = _record_best_prices(
+        markets, market_key, commission_rate, game.get("home_team"), stake_total
+    )
     entries = []
     for line_key, offers in best_lines.items():
         # Skip lines that aren't genuine two-way markets (e.g., moneyline with a draw option).
@@ -476,8 +531,11 @@ def _collect_market_entries(
             continue
         outcomes = list(offers.values())
         names = {o["name"] for o in outcomes}
-        expected = ({"Over", "Under"} if market_key == "totals"
-                    else {game.get("home_team"), game.get("away_team")})
+        expected = (
+            {"Over", "Under"}
+            if market_key == "totals"
+            else {game.get("home_team"), game.get("away_team")}
+        )
         if names != expected:
             continue
         if market_key == "spreads":
@@ -503,22 +561,23 @@ def _collect_market_entries(
                 "effective_price": o["effective_price"],
                 "point": o.get("point"),
                 "is_exchange": o.get("is_exchange", False),
+                "last_update": o.get("last_update"),
+                "bet_limit": o.get("bet_limit"),
             }
             for o in outcomes
         ]
         net_stake_info = _calculate_stakes(outcomes, stake_total, price_field="effective_price")
         gross_stake_info = (
-            _calculate_stakes(outcomes, stake_total, price_field="display_price") if has_exchange else None
+            _calculate_stakes(outcomes, stake_total, price_field="display_price")
+            if has_exchange
+            else None
         )
         net_roi = net_stake_info["roi_percent"]
         gross_roi = gross_stake_info["roi_percent"] if gross_stake_info else net_roi
-        if not has_exchange and net_roi <= 0:
-            continue
-        if has_exchange and net_roi <= 0 and gross_roi <= 0:
+        if net_roi <= 0:
             continue
         exchange_names = {
-            o.get("bookmaker")
-            or EXCHANGE_BOOKMAKERS.get(o.get("bookmaker_key"), {}).get("name")
+            o.get("bookmaker") or EXCHANGE_BOOKMAKERS.get(o.get("bookmaker_key"), {}).get("name")
             for o in outcomes
             if o.get("is_exchange")
         }
@@ -535,6 +594,9 @@ def _collect_market_entries(
             "gross_roi_percent": round(gross_roi, 2) if has_exchange else round(net_roi, 2),
             "best_odds": outcome_payload,
             "stakes": net_stake_info,
+            "execution": execution_check(
+                outcomes, [o["stake"] for o in net_stake_info["breakdown"]]
+            ),
             "gross_stakes": gross_stake_info,
             "has_exchange": has_exchange,
             "exchange_books": exchange_books,
@@ -546,7 +608,22 @@ def _collect_market_entries(
 def _collect_middle_opportunities(
     game: dict, market_key: str, stake_total: float, commission_rate: float
 ) -> List[dict]:
-    if market_key not in MIDDLE_MARKETS or stake_total <= 0:
+    if (
+        market_key not in MIDDLE_MARKETS
+        or stake_total <= 0
+        or not (game.get("sport_key") or "").startswith(
+            (
+                "americanfootball_",
+                "basketball_",
+                "baseball_",
+                "icehockey_",
+                "soccer_",
+                "rugbyleague_",
+                "rugbyunion_",
+                "aussierules_",
+            )
+        )
+    ):
         return []
     bookmakers = game.get("bookmakers", [])
     offers = []
@@ -574,6 +651,7 @@ def _collect_middle_opportunities(
                 effective_price = _apply_commission(display_price, commission_rate, is_exchange)
                 offers.append(
                     {
+                        **quote_metadata(book, market, outcome),
                         "pair_key": f"{bookmaker_key}:{name}:{point_value}",
                         "bookmaker": bookmaker_title,
                         "bookmaker_key": bookmaker_key,
@@ -607,32 +685,47 @@ def _collect_plus_ev_opportunities(
     min_edge_percent: float,
     bankroll: float,
     kelly_fraction: float,
+    target_books: Optional[Sequence[str]] = None,
+    diagnostics: Optional[dict] = None,
 ) -> List[dict]:
     bookmakers = game.get("bookmakers", [])
-    sharp_meta = None
-    sharp_bookmaker = None
+    sharp_reference = {}
     for candidate in sharp_priority:
-        for book in bookmakers:
-            if book.get("key") == candidate.get("key"):
-                sharp_meta = candidate
-                sharp_bookmaker = book
-                break
-        if sharp_bookmaker:
-            break
-    if not sharp_bookmaker or not sharp_meta:
-        return []
-    is_sharp_exchange = sharp_meta.get("type") == "exchange"
-    sharp_reference = _build_sharp_reference(sharp_bookmaker, commission_rate, is_sharp_exchange)
+        for sharp in bookmakers:
+            if sharp.get("key") != candidate.get("key"):
+                continue
+            references = _build_sharp_reference(
+                sharp,
+                commission_rate,
+                candidate.get("type") == "exchange",
+                diagnostics,
+            )
+            for line, reference in references.items():
+                # A spread reference also identifies which team holds each signed line.
+                signature = (
+                    *line,
+                    tuple(
+                        sorted(
+                            (name, data.get("point"))
+                            for name, data in reference["outcomes"].items()
+                        )
+                    ),
+                )
+                sharp_reference.setdefault(signature, (reference, candidate))
     if not sharp_reference:
+        if diagnostics is not None:
+            diagnostics["events_without_reference"] = (
+                diagnostics.get("events_without_reference", 0) + 1
+            )
         return []
     opportunities: List[dict] = []
     for book in bookmakers:
         key = book.get("key")
         if not key:
             continue
-        if key == sharp_meta.get("key"):
+        if key in SHARP_BOOK_MAP or key in EXCHANGE_KEYS:
             continue
-        if SOFT_BOOK_KEY_SET and key not in SOFT_BOOK_KEY_SET:
+        if target_books and key not in target_books:
             continue
         bookmaker_title = book.get("title") or key
         is_exchange = key in EXCHANGE_KEYS
@@ -642,9 +735,15 @@ def _collect_plus_ev_opportunities(
         for (market_key, line_key), entries in soft_lines.items():
             if market_key not in markets:
                 continue
-            reference = sharp_reference.get((market_key, line_key))
-            if not reference:
+            signature = (
+                market_key,
+                line_key,
+                tuple(sorted((entry["name"], entry.get("point")) for entry in entries)),
+            )
+            match = sharp_reference.get(signature)
+            if not match:
                 continue
+            reference, sharp_meta = match
             for entry in entries:
                 name_norm = entry["name"]
                 sharp_outcome = reference["outcomes"].get(name_norm)
@@ -684,16 +783,21 @@ def _collect_plus_ev_opportunities(
                         "effective_odds": effective_price,
                         "is_exchange": is_exchange,
                         "point": soft_point,
+                        "last_update": entry.get("last_update"),
+                        "bet_limit": entry.get("bet_limit"),
                     },
                     "sharp": {
-                        "book": sharp_meta.get("name") or sharp_bookmaker.get("title") or sharp_meta.get("key"),
+                        "book": sharp_meta.get("name") or sharp_meta.get("key"),
                         "key": sharp_meta.get("key"),
+                        "last_update": sharp_outcome.get("last_update"),
                         "odds": sharp_outcome["sharp_odds"],
                         "opponent_odds": sharp_outcome["opponent_odds"],
                         "opponent": sharp_outcome["opponent_name"],
                         "fair_odds": sharp_outcome["fair_odds"],
                         "true_probability": sharp_outcome["true_probability"],
-                        "true_probability_percent": round(sharp_outcome["true_probability"] * 100, 2),
+                        "true_probability_percent": round(
+                            sharp_outcome["true_probability"] * 100, 2
+                        ),
                         "vig_percent": reference.get("vig_percent"),
                     },
                     "edge_percent": round(net_edge, 2),
@@ -707,6 +811,9 @@ def _collect_plus_ev_opportunities(
                     },
                     "has_exchange": is_exchange,
                 }
+                opportunity["execution"] = execution_check(
+                    [{**entry, "bookmaker": bookmaker_title}], [recommended]
+                )
                 opportunities.append(opportunity)
     return opportunities
 
@@ -729,23 +836,16 @@ def _build_middle_entry(
     is_total = market_key == "totals"
 
     if market_key == "spreads":
-        if offer_a["line"] < 0 and offer_b["line"] > 0:
-            favorite_offer, underdog_offer = offer_a, offer_b
-        elif offer_b["line"] < 0 and offer_a["line"] > 0:
-            favorite_offer, underdog_offer = offer_b, offer_a
-        else:
+        if {offer_a["team"], offer_b["team"]} != {home_team, away_team}:
             return None
-        # Require opposite teams so we're not pairing two prices on the same side
-        team_a = (favorite_offer.get("team") or "").strip().lower()
-        team_b = (underdog_offer.get("team") or "").strip().lower()
-        if not team_a or not team_b or team_a == team_b:
-            return None
+        favorite_offer, underdog_offer = (
+            (offer_a, offer_b) if offer_a["team"] == home_team else (offer_b, offer_a)
+        )
         gap_info = _spread_gap_info(favorite_offer["line"], underdog_offer["line"])
         if not gap_info:
             return None
-        side_a = favorite_offer
-        side_b = underdog_offer
-        descriptor_name = side_a["team"]
+        side_a, side_b = favorite_offer, underdog_offer
+        descriptor_name = side_a["team"] + " margin"
     else:
         names = {
             offer_a["team"].strip().lower(): offer_a,
@@ -770,49 +870,19 @@ def _build_middle_entry(
     middle_integers = gap_info["middle_integers"]
     if not middle_integers:
         return None
-    middle_probability = _estimate_middle_probability(middle_integers, sport_key, market_key)
-    if middle_probability <= 0:
-        return None
 
     stake_a, stake_b = _calculate_middle_stakes(
         side_a["effective_price"], side_b["effective_price"], stake_total
     )
     if stake_a <= 0 or stake_b <= 0:
         return None
-    outcomes = _calculate_middle_outcomes(stake_a, stake_b, side_a["effective_price"], side_b["effective_price"])
-    ev_dollars = _calculate_middle_ev(
-        outcomes["win_both_profit"],
-        outcomes["side_a_wins_profit"],
-        outcomes["side_b_wins_profit"],
-        middle_probability,
+    outcomes = _calculate_middle_outcomes(
+        stake_a, stake_b, side_a["effective_price"], side_b["effective_price"]
     )
-    ev_percent = round((ev_dollars / stake_total) * 100, 2) if stake_total else 0.0
+    profile = middle_profile(side_a, side_b, stake_a, stake_b, is_total)
+    if profile is None:
+        return None
     has_exchange = side_a["is_exchange"] or side_b["is_exchange"]
-    gross_ev_percent = None
-    if has_exchange:
-        gross_stake_a, gross_stake_b = _calculate_middle_stakes(
-            side_a["display_price"], side_b["display_price"], stake_total
-        )
-        if gross_stake_a > 0 and gross_stake_b > 0:
-            gross_outcomes = _calculate_middle_outcomes(
-                gross_stake_a, gross_stake_b, side_a["display_price"], side_b["display_price"]
-            )
-            gross_ev = _calculate_middle_ev(
-                gross_outcomes["win_both_profit"],
-                gross_outcomes["side_a_wins_profit"],
-                gross_outcomes["side_b_wins_profit"],
-                middle_probability,
-            )
-            gross_ev_percent = round((gross_ev / stake_total) * 100, 2) if stake_total else 0.0
-
-    key_numbers_crossed: List[int] = []
-    includes_key_number = False
-    if sport_key in KEY_NUMBER_SPORTS and market_key == "spreads":
-        key_numbers_crossed = [
-            integer for integer in middle_integers if integer in NFL_KEY_NUMBER_PROBABILITY
-        ]
-        includes_key_number = bool(key_numbers_crossed)
-
     middle_zone = _format_middle_zone(descriptor_name, middle_integers, is_total)
     best_odds = (
         {
@@ -822,6 +892,8 @@ def _build_middle_entry(
             "effective_price": side_a["effective_price"],
             "bookmaker": side_a["bookmaker"],
             "is_exchange": side_a["is_exchange"],
+            "last_update": side_a.get("last_update"),
+            "bet_limit": side_a.get("bet_limit"),
         },
         {
             "team": side_b["team"],
@@ -830,6 +902,8 @@ def _build_middle_entry(
             "effective_price": side_b["effective_price"],
             "bookmaker": side_b["bookmaker"],
             "is_exchange": side_b["is_exchange"],
+            "last_update": side_b.get("last_update"),
+            "bet_limit": side_b.get("bet_limit"),
         },
     )
     stakes_payload = {
@@ -847,8 +921,7 @@ def _build_middle_entry(
     opportunity = {
         "id": str(uuid.uuid4()),
         "sport": sport_key,
-        "sport_display": game.get("sport_display")
-        or SPORT_DISPLAY_NAMES.get(sport_key, sport_key),
+        "sport_display": game.get("sport_display") or SPORT_DISPLAY_NAMES.get(sport_key, sport_key),
         "event": f"{game.get('away_team', away_team)} vs {game.get('home_team', home_team)}",
         "commence_time": game.get("commence_time"),
         "market": market_key,
@@ -858,18 +931,19 @@ def _build_middle_entry(
             "points": gap_info["gap_points"],
             "middle_integers": middle_integers,
             "integer_count": gap_info["integer_count"],
-            "includes_key_number": includes_key_number,
-            "key_numbers_crossed": key_numbers_crossed,
         },
         "middle_zone": middle_zone,
-        "middle_probability": middle_probability,
-        "probability_percent": round(middle_probability * 100, 2),
+        "profile": profile,
+        "break_even_percent": profile["break_even_percent"],
+        "middle_probability": None,
+        "probability_percent": None,
         "stakes": stakes_payload,
         "outcomes": outcomes,
-        "ev_dollars": ev_dollars,
-        "ev_percent": ev_percent,
+        "ev_dollars": None,
+        "ev_percent": None,
+        "execution": execution_check([side_a, side_b], [stake_a, stake_b]),
         "has_exchange": has_exchange,
-        "gross_ev_percent": gross_ev_percent,
+        "gross_ev_percent": None,
         "sport_title": game.get("sport_title"),
     }
     return opportunity
@@ -906,8 +980,11 @@ def _calculate_stakes(outcomes: List[dict], stake_total: float, price_field: str
     allocated = 0.0
     for index, (outcome, inv) in enumerate(zip(outcomes, inverses)):
         fraction = inv / inverse_sum
-        stake_value = (round(stake_total - allocated, 2) if index == len(outcomes) - 1
-                       else round(stake_total * fraction, 2))
+        stake_value = (
+            round(stake_total - allocated, 2)
+            if index == len(outcomes) - 1
+            else round(stake_total * fraction, 2)
+        )
         allocated += stake_value
         price_used = outcome.get(price_field)
         display_price = outcome.get("display_price", price_used)
@@ -964,34 +1041,20 @@ def _summaries(
 
 
 def _middle_summary(opportunities: List[dict]) -> dict:
-    count = len(opportunities)
-    positive = [opp for opp in opportunities if opp.get("ev_percent", 0) > 0]
-    avg_ev = (
-        round(sum(opp.get("ev_percent", 0) for opp in opportunities) / count, 2)
-        if count
-        else 0.0
-    )
-    best = max(opportunities, key=lambda o: o.get("ev_percent", 0), default=None)
-    by_sport: Dict[str, int] = {}
-    key_numbers: Dict[str, int] = {}
+    thresholds = [
+        o["break_even_percent"] for o in opportunities if o.get("break_even_percent") is not None
+    ]
+    by_sport = {}
     for opp in opportunities:
         sport = opp.get("sport_display") or opp.get("sport") or "unknown"
         by_sport[sport] = by_sport.get(sport, 0) + 1
-        for key_number in opp.get("gap", {}).get("key_numbers_crossed", []):
-            key_numbers[str(key_number)] = key_numbers.get(str(key_number), 0) + 1
     return {
-        "count": count,
-        "positive_count": len(positive),
-        "average_ev_percent": avg_ev,
-        "best_ev": {
-            "ev_percent": best.get("ev_percent") if best else None,
-            "event": best.get("event") if best else None,
-            "sport": best.get("sport_display") if best else None,
-        }
-        if best
-        else None,
+        "count": len(opportunities),
         "by_sport": by_sport,
-        "key_numbers": key_numbers,
+        "average_break_even_percent": round(sum(thresholds) / len(thresholds), 2)
+        if thresholds
+        else None,
+        "lowest_break_even_percent": min(thresholds, default=None),
     }
 
 
@@ -1004,9 +1067,17 @@ def _deduplicate_middles(opportunities: List[dict]) -> List[dict]:
             opp.get("commence_time"),
             opp.get("market"),
             opp.get("side_a", {}).get("team"),
+            opp.get("side_a", {}).get("bookmaker"),
+            opp.get("side_b", {}).get("bookmaker"),
+            opp.get("side_a", {}).get("line"),
+            opp.get("side_b", {}).get("line"),
             tuple(opp.get("gap", {}).get("middle_integers", [])),
         )
-        if key not in best_by_key or opp.get("ev_percent", 0) > best_by_key[key].get("ev_percent", 0):
+        if (
+            key not in best_by_key
+            or opp["profile"]["worst_case_profit"]
+            > best_by_key[key]["profile"]["worst_case_profit"]
+        ):
             best_by_key[key] = opp
     return list(best_by_key.values())
 
@@ -1014,9 +1085,7 @@ def _deduplicate_middles(opportunities: List[dict]) -> List[dict]:
 def _plus_ev_summary(opportunities: List[dict]) -> dict:
     count = len(opportunities)
     avg_edge = (
-        round(sum(opp.get("edge_percent", 0) for opp in opportunities) / count, 2)
-        if count
-        else 0.0
+        round(sum(opp.get("edge_percent", 0) for opp in opportunities) / count, 2) if count else 0.0
     )
     best = max(opportunities, key=lambda o: o.get("edge_percent", 0), default=None)
     total_ev = round(sum(opp.get("ev_per_100", 0) for opp in opportunities), 2)
@@ -1062,6 +1131,7 @@ def _deduplicate_plus_ev(opportunities: List[dict]) -> List[dict]:
             opp.get("sport"),
             opp.get("commence_time"),
             opp.get("market"),
+            bet.get("soft_key"),
             (bet.get("outcome") or "").strip().lower(),
             normalized_point,
         )
@@ -1069,6 +1139,48 @@ def _deduplicate_plus_ev(opportunities: List[dict]) -> List[dict]:
         if not existing or (opp.get("edge_percent", 0) > existing.get("edge_percent", 0)):
             best_by_key[key] = opp
     return list(best_by_key.values())
+
+
+def estimate_plan(sports, regions):
+    items = [
+        {
+            "key": s["key"],
+            "name": s.get("title") or s["key"],
+            "markets": markets_for_sport(s["key"]),
+            "max_credits": len(markets_for_sport(s["key"])) * len(regions),
+        }
+        for s in sports
+    ]
+    return {
+        "sports": items,
+        "regions": regions,
+        "odds_requests": len(items),
+        "max_credits": sum(s["max_credits"] for s in items),
+    }
+
+
+def plan_scan(
+    api_key,
+    sports=None,
+    all_sports=False,
+    regions=None,
+    sharp_book=DEFAULT_SHARP_BOOK,
+    window_hours=24,
+):
+    if not api_key:
+        return {"success": False, "error": "API key is required", "error_code": 400}
+    quota = Quota()
+    try:
+        available = fetch_sports(api_key, quota)
+    except ScannerError as exc:
+        return {"success": False, "error": str(exc), "error_code": exc.status_code}
+    selected = filter_sports(available, sports or DEFAULT_SPORT_KEYS, all_sports)
+    normalized = _ensure_sharp_region(_normalize_regions(regions), sharp_book)
+    return {
+        "success": True,
+        "plan": {**estimate_plan(selected, normalized), "window_hours": window_hours},
+        "quota": quota.as_dict(),
+    }
 
 
 def run_scan(
@@ -1082,6 +1194,10 @@ def run_scan(
     min_edge_percent: float = MIN_EDGE_PERCENT,
     bankroll: float = DEFAULT_BANKROLL,
     kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+    max_quote_age: float = DEFAULT_MAX_AGE,
+    target_books: Optional[Sequence[str]] = None,
+    max_credits: Optional[int] = None,
+    window_hours: Optional[int] = 24,
 ) -> dict:
     if not api_key:
         return {"success": False, "error": "API key is required", "error_code": 400}
@@ -1096,12 +1212,46 @@ def run_scan(
             "error_code": 400,
         }
     commission_rate = _clamp_commission(commission_rate)
+    quota = Quota()
     try:
-        sports_list = fetch_sports(api_key)
+        sports_list = fetch_sports(api_key, quota)
     except ScannerError as exc:
-        return {"success": False, "error": str(exc), "error_code": 500}
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_code": exc.status_code,
+            "quota": quota.as_dict(),
+        }
 
     filtered = filter_sports(sports_list, sports or DEFAULT_SPORT_KEYS, all_sports)
+    estimate = {**estimate_plan(filtered, normalized_regions), "window_hours": window_hours}
+    if max_credits is not None and estimate["max_credits"] > max_credits:
+        return {
+            "success": False,
+            "error": "Scan cost exceeds the approved credit budget. Review the scan again.",
+            "error_code": 409,
+            "plan": estimate,
+        }
+    if quota.remaining is not None and estimate["max_credits"] > quota.remaining:
+        return {
+            "success": False,
+            "error": "Insufficient API credits for this scan. Select fewer sports or regions.",
+            "error_code": 429,
+            "quota": quota.as_dict(),
+        }
+    quality = {
+        key: 0
+        for key in (
+            "invalid_events",
+            "started_or_invalid_events",
+            "invalid_markets",
+            "missing_or_invalid_timestamps",
+            "stale_markets",
+            "fresh_markets",
+            "outside_window_events",
+        )
+    }
+    coverage = {}
 
     arb_opportunities: List[dict] = []
     middle_opportunities: List[dict] = []
@@ -1111,6 +1261,7 @@ def run_scan(
     sport_errors: List[dict] = []
     successful_sports = 0
     api_calls_used = 0
+    terminal_status = 502
     sharp_priority = _sharp_priority(sharp_book or DEFAULT_SHARP_BOOK)
 
     for sport in filtered:
@@ -1118,35 +1269,55 @@ def run_scan(
         if not sport_key:
             continue
         markets = markets_for_sport(sport_key)
+        if quota.remaining is not None and len(markets) * len(normalized_regions) > quota.remaining:
+            sport_errors.append(
+                {"sport_key": sport_key, "error": "Insufficient remaining API credits"}
+            )
+            break
         api_calls_used += 1
         try:
-            events = fetch_odds_for_sport(api_key, sport_key, markets, normalized_regions)
+            events = fetch_odds_for_sport(
+                api_key, sport_key, markets, normalized_regions, quota, window_hours
+            )
         except ScannerError as exc:
             sport_errors.append(
                 {
                     "sport_key": sport_key,
-                    "sport": sport.get("title")
-                    or SPORT_DISPLAY_NAMES.get(sport_key, sport_key),
+                    "sport": sport.get("title") or SPORT_DISPLAY_NAMES.get(sport_key, sport_key),
                     "error": str(exc),
                 }
             )
+            if exc.fatal:
+                terminal_status = exc.status_code
+                break
             continue
         successful_sports += 1
         events_scanned += len(events)
-        for game in events:
+        for raw_game in events:
+            game = usable_game(raw_game, dt.datetime.now(UTC), max_quote_age, quality, window_hours)
+            if game is None:
+                continue
+            for book in game["bookmakers"]:
+                coverage[book["key"]] = book.get("title") or book["key"]
             game["sport_key"] = sport_key
             game["sport_title"] = sport.get("title")
             game["sport_display"] = SPORT_DISPLAY_NAMES.get(sport_key, sport_key)
+            trading_game = {
+                **game,
+                "bookmakers": [
+                    b for b in game["bookmakers"] if not target_books or b["key"] in target_books
+                ],
+            }
             for market_key in markets:
                 new_entries = _collect_market_entries(
-                    game, market_key, stake_amount, commission_rate
+                    trading_game, market_key, stake_amount, commission_rate
                 )
                 for entry in new_entries:
                     total_profit += entry["stakes"].get("guaranteed_profit", 0.0)
                 arb_opportunities.extend(new_entries)
                 if market_key in MIDDLE_MARKETS:
                     middle_entries = _collect_middle_opportunities(
-                        game, market_key, stake_amount, commission_rate
+                        trading_game, market_key, stake_amount, commission_rate
                     )
                     middle_opportunities.extend(middle_entries)
             plus_entries = _collect_plus_ev_opportunities(
@@ -1154,14 +1325,23 @@ def run_scan(
                 markets,
                 sharp_priority,
                 commission_rate,
-                min_edge_percent,
+                0.0,
                 bankroll,
                 kelly_fraction,
+                target_books,
+                quality,
             )
             plus_ev_opportunities.extend(plus_entries)
 
+    final_time = dt.datetime.now(UTC)
+    arb_opportunities = current_opportunities(arb_opportunities, final_time, max_quote_age)
+    middle_opportunities = current_opportunities(middle_opportunities, final_time, max_quote_age)
+    plus_ev_opportunities = current_opportunities(plus_ev_opportunities, final_time, max_quote_age)
+    total_profit = sum(o["stakes"]["guaranteed_profit"] for o in arb_opportunities)
     arb_opportunities.sort(key=lambda x: x["roi_percent"], reverse=True)
-    middle_opportunities.sort(key=lambda x: x["ev_percent"], reverse=True)
+    middle_opportunities.sort(
+        key=lambda x: x["break_even_percent"] if x["break_even_percent"] is not None else 100
+    )
     middle_opportunities = _deduplicate_middles(middle_opportunities)
     plus_ev_opportunities = _deduplicate_plus_ev(plus_ev_opportunities)
     plus_ev_opportunities.sort(key=lambda x: x.get("edge_percent", 0), reverse=True)
@@ -1171,8 +1351,13 @@ def run_scan(
     middle_summary = _middle_summary(middle_opportunities)
     plus_ev_summary = _plus_ev_summary(plus_ev_opportunities)
     if filtered and not successful_sports:
-        return {"success": False, "error": "All selected sports failed to load.",
-                "error_code": 502, "sport_errors": sport_errors}
+        return {
+            "success": False,
+            "error": "All selected sports failed to load.",
+            "error_code": terminal_status,
+            "sport_errors": sport_errors,
+            "quota": quota.as_dict(),
+        }
     return {
         "success": True,
         "scan_time": _iso_now(),
@@ -1206,9 +1391,16 @@ def run_scan(
         },
         "sport_errors": sport_errors,
         "partial": bool(sport_errors),
+        "quota": quota.as_dict(),
+        "plan": estimate,
+        "quality": quality,
+        "max_quote_age": max_quote_age,
+        "bookmakers": [{"key": key, "name": name} for key, name in sorted(coverage.items())],
         "regions": normalized_regions,
         "commission_rate": commission_rate,
     }
+
+
 def _remove_vig(odds_a: float, odds_b: float) -> Tuple[float, float, float]:
     """Return fair odds for both sides plus vig percent."""
     if odds_a <= 1 or odds_b <= 1:
