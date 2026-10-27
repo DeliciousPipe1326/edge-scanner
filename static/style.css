@@ -393,6 +393,10 @@ main {
   background: #94a3b8;
 }
 
+.results-card {
+  overflow-x: auto;
+}
+
 .results-card .card-head {
   display: flex;
   justify-content: space-between;
