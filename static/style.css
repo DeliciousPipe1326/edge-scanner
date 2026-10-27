@@ -71,6 +71,22 @@ main {
   margin-top: 1.2rem;
 }
 
+.risk-notice {
+  border-left: 6px solid var(--warning);
+}
+
+.risk-notice h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.1rem;
+  line-height: 1.4;
+}
+
+.risk-notice p {
+  max-width: 90ch;
+  margin: 0.65rem 0 0;
+  line-height: 1.6;
+}
+
 .summary-info p {
   margin: 0.2rem 0;
 }

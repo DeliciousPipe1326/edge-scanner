@@ -2,6 +2,14 @@
 
 **Arbitrage • Middles • +EV**
 
+## IMPORTANT — ODDS ANALYSIS, NOT BETTING ADVICE
+
+> Edge Scanner is free software for inspecting and comparing sports odds. Its results do not establish that a bet is profitable or that displayed prices and stakes are available.
+>
+> **Variance is not an edge. Short-term wins do not demonstrate a reliable advantage. Gambling can cause financial loss.**
+>
+> The software is provided “as is”, without warranty, under the MIT license. You are responsible for your decisions and use of its results. **Use at your own risk.**
+
 Edge Scanner is a **free, open-source sports betting scanner** you can run locally, use as-is, or adapt to your own needs under the MIT license. It scans for arbitrage candidates, middles, and +EV estimates across US, UK, EU, and Australian bookmakers. There is no Edge Scanner subscription.
 
 **You need your own [The Odds API](https://the-odds-api.com/) key.** Scans consume credits from your API account and are subject to the provider's credit limits, rate limits, and plan terms. The scanner does not include an API key or an odds-data allowance; any data-provider charges are separate from this free software.
