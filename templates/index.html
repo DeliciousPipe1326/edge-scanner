@@ -81,6 +81,7 @@
                 <input type="number" id="commission-input" min="0" max="15" step="0.5" value="{{ default_commission_percent }}" />
               </div>
               <p class="helper">Net ROI/EV already reflects this commission.</p>
+              <p class="helper">Odds requests can cost multiple credits: markets × regions. The sharp reference may add EU.</p>
             </div>
           </div>
         </div>
@@ -132,7 +133,7 @@
             <option value="{{ book.key }}" {% if book.key == default_sharp_book %}selected{% endif %}>{{ book.name }}</option>
             {% endfor %}
           </select>
-          <p class="helper">Used as the "true" odds source. Pinnacle recommended.</p>
+          <p class="helper">Reference prices used to estimate fair odds after removing vig.</p>
         </div>
         <div class="field">
           <label class="field-label">Minimum Edge (%)</label>
@@ -178,7 +179,7 @@
           <span class="stat-value">0</span>
         </div>
         <div class="stat-card" id="stat-calls">
-          <span class="stat-label">API Calls</span>
+          <span class="stat-label">Odds Requests</span>
           <span class="stat-value">0</span>
         </div>
       </section>
@@ -298,7 +299,7 @@
       </section>
 
       <section class="card middle-caveat">
-        <p><strong>Understanding Middles:</strong> Middles are high-variance plays. They typically lose small amounts and win big when the final score lands inside the gap. Probabilities are estimates based on historical scoring distributions (NFL key numbers like 3 &amp; 7 dramatically boost EV). Treat the EV as guidance, not a guarantee, and stake responsibly.</p>
+        <p><strong>Understanding Middles:</strong> Middles are high-variance plays. They typically lose small amounts and win big when the final score lands inside the gap. Probabilities use fixed, uncalibrated heuristics, including football key-number weights. Estimated EV assumes the two miss outcomes are equally likely and omits pushes. It does not establish a profitable strategy.</p>
       </section>
     </section>
 
@@ -360,7 +361,7 @@
               <th>Bet</th>
               <th>Soft Odds</th>
               <th>Fair Odds</th>
-              <th>True Prob</th>
+              <th>Est. Prob</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -369,7 +370,7 @@
       </section>
 
       <section class="card middle-caveat">
-        <p><strong>Understanding +EV Betting:</strong> Sharp books (Pinnacle, Betfair, Matchbook) provide near "true" odds. When a soft book posts a higher price than fair value, the bet has positive expected value. +EV bets still lose roughly half the time—the edge shows up over many wagers. Kelly staking helps size bets, but variance can still be high. Always confirm odds before betting; edges disappear quickly.</p>
+        <p><strong>Understanding +EV Betting:</strong> Sharp books (Pinnacle, Betfair, Matchbook) provide reference prices; removing vig does not establish true probabilities. A higher soft-book price implies positive EV under that reference model. Win rates depend on the odds, and estimated edges can be wrong. Kelly staking helps size bets, but variance can still be high. Always confirm odds before betting; edges disappear quickly.</p>
       </section>
     </section>
   </main>
@@ -525,9 +526,9 @@
         allSports: allSportsToggle.checked,
         stake: stakeValue,
         sharpBook: sharpSelect?.value || appConfig.defaultSharpBook,
-        minEdgePercent: parseFloat(minEdgeInput?.value) || appConfig.defaultMinEdgePercent || 1,
-        bankroll: parseFloat(bankrollInput?.value) || appConfig.defaultBankroll || 1000,
-        kellyFraction: parseFloat(kellySelect?.value) || appConfig.defaultKellyFraction || 0.25,
+        minEdgePercent: numberOrDefault(minEdgeInput?.value, appConfig.defaultMinEdgePercent ?? 1),
+        bankroll: numberOrDefault(bankrollInput?.value, appConfig.defaultBankroll ?? 1000),
+        kellyFraction: numberOrDefault(kellySelect?.value, appConfig.defaultKellyFraction ?? 0.25),
       });
     });
 
@@ -595,8 +596,18 @@
     function setScanning(isScanning) {
       scanBtn.disabled = isScanning;
       scanBtn.textContent = isScanning ? 'Scanning…' : 'Scan Now';
-      statusEl.textContent = isScanning ? 'Scanning, please wait…' : '';
-      statusEl.className = 'status';
+      if (isScanning) showStatus('Scanning, please wait…', '');
+    }
+
+    function numberOrDefault(value, fallback) {
+      const number = parseFloat(value);
+      return Number.isFinite(number) ? number : fallback;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[char]));
     }
 
     function showStatus(message, type) {
@@ -647,8 +658,8 @@
             <td>${grossCell}</td>
             <td class="profit-cell ${profitClass}">${calcNet ? formatProfit(profitValue) : '-'}</td>
             <td>${formatExchangeCell(opp)}</td>
-            <td>${opp.sport_display || opp.sport || ''}</td>
-            <td>${opp.event || ''}</td>
+            <td>${escapeHtml(opp.sport_display || opp.sport || '')}</td>
+            <td>${escapeHtml(opp.event || '')}</td>
             <td>${commence}</td>
             <td>${formatMarket(opp)}</td>
             <td>${formatOutcome(breakdown[0])}</td>
@@ -679,7 +690,7 @@
           <h3>Summary</h3>
           <p>Found <strong>${arbData.opportunities_count || opportunities.length}</strong> opportunities across <strong>${summary.events_scanned}</strong> events in <strong>${summary.sports_scanned}</strong> sports.</p>
           <p>Total potential profit: <strong>${formatCurrency(totalProfit)}</strong>${totalStaked ? ` on ${formatCurrency(totalStaked)} staked` : ''}</p>
-          <p>API calls used: ${summary.api_calls_used}${regionsLabel ? ` • Regions: ${regionsLabel}` : ''}</p>
+          <p>Odds requests made: ${summary.api_calls_used}${regionsLabel ? ` • Regions: ${regionsLabel}` : ''}</p>
           <p>Exchange commission applied: ${commissionPercent}.</p>
           <p class="helper">ROI = return on total stake. 2% ROI means $2 profit on a $100 stake.</p>
         `;
@@ -730,7 +741,7 @@
       middleStatBest.textContent = formatPercent(stats.best_ev_percent);
       if (stats.count > 0) {
         middleSummaryInfo.classList.remove('hidden');
-        const bestText = stats.best_event ? ` • Best: ${stats.best_event}` : '';
+        const bestText = stats.best_event ? ` • Best: ${escapeHtml(stats.best_event)}` : '';
         middleSummaryInfo.innerHTML = `
           <h3>Summary</h3>
           <p>Middles matching filters: <strong>${stats.count}</strong>, with <strong>${stats.positive_count}</strong> positive EV.</p>
@@ -772,13 +783,13 @@
             <td>${formatPercent(opp.ev_percent)}${opp.has_exchange && typeof opp.gross_ev_percent === 'number' ? `<span class="ev-gross">Gross ${formatPercent(opp.gross_ev_percent)}</span>` : ''}</td>
             <td>${formatPercent(opp.probability_percent)}</td>
             <td>${formatGapCell(opp)}</td>
-            <td>${opp.sport_display || opp.sport || ''}</td>
-            <td>${opp.event || ''}</td>
+            <td>${escapeHtml(opp.sport_display || opp.sport || '')}</td>
+            <td>${escapeHtml(opp.event || '')}</td>
             <td>${commence}</td>
-            <td>${opp.market || ''}</td>
+            <td>${escapeHtml(opp.market || '')}</td>
             <td>${formatMiddleSide(opp.side_a, stakeA)}</td>
             <td>${formatMiddleSide(opp.side_b, stakeB)}</td>
-            <td>${opp.middle_zone || ''}</td>
+            <td>${escapeHtml(opp.middle_zone || '')}</td>
             <td class="profit-cell">${formatProfit(winBoth)}</td>
             <td class="profit-cell">${formatProfit(miss)}</td>
           `;
@@ -790,9 +801,9 @@
     function renderPlusEv() {
       const plusData = lastScanData?.plus_ev;
       const opportunities = plusData?.opportunities || [];
-      const minEdge = parseFloat(minEdgeInput.value) || appConfig.defaultMinEdgePercent || 1;
-      const bankroll = parseFloat(bankrollInput.value) || appConfig.defaultBankroll || 1000;
-      const kellyFraction = parseFloat(kellySelect.value) || appConfig.defaultKellyFraction || 0.25;
+      const minEdge = numberOrDefault(minEdgeInput.value, appConfig.defaultMinEdgePercent ?? 1);
+      const bankroll = numberOrDefault(bankrollInput.value, appConfig.defaultBankroll ?? 1000);
+      const kellyFraction = numberOrDefault(kellySelect.value, appConfig.defaultKellyFraction ?? 0.25);
       const sortKey = plusEvSortSelect.value || 'edge';
       const filtered = opportunities.filter((opp) => (opp.edge_percent || 0) >= minEdge);
       filtered.sort((a, b) => {
@@ -821,7 +832,7 @@
       plusEvTotal.textContent = formatCurrency(stats.total_ev_per_100);
       if (stats.count > 0) {
         plusEvSummaryInfo.classList.remove('hidden');
-        const bestText = stats.best_event ? `Best: ${stats.best_event}` : '';
+        const bestText = stats.best_event ? `Best: ${escapeHtml(stats.best_event)}` : '';
         plusEvSummaryInfo.innerHTML = `
           <h3>Summary</h3>
           <p>+EV bets: <strong>${stats.count}</strong> • Average edge <strong>${formatPercent(stats.average_edge_percent)}</strong> • ${bestText}</p>
@@ -851,8 +862,8 @@
           <td>${formatEdgeCell(opp)}</td>
           <td class="profit-cell">${formatProfit(opp.ev_per_100 || 0)}</td>
           <td>${formatKellyCell(kellyData)}</td>
-          <td>${opp.sport_display || opp.sport || ''}</td>
-          <td>${opp.event || ''}</td>
+          <td>${escapeHtml(opp.sport_display || opp.sport || '')}</td>
+          <td>${escapeHtml(opp.event || '')}</td>
           <td>${commence}</td>
           <td>${formatPlusMarket(opp)}</td>
           <td>${formatPlusBet(opp)}</td>
@@ -908,17 +919,17 @@
     function formatPlusMarket(opp) {
       if (!opp) return '';
       if ((opp.market === 'spreads' || opp.market === 'totals') && opp.market_point !== undefined && opp.market_point !== null) {
-        return `${opp.market} (${formatLine(opp.market_point)})`;
+        return `${escapeHtml(opp.market)} (${formatLine(opp.market_point)})`;
       }
-      return opp.market || '';
+      return escapeHtml(opp.market || '');
     }
 
     function formatPlusBet(opp) {
       if (!opp?.bet) return '';
       const exchangeBadge = opp.bet.is_exchange ? '<span class="exchange-badge">Exchange</span>' : '';
-      const book = opp.bet.soft_book ? ` @ ${opp.bet.soft_book}` : '';
+      const book = opp.bet.soft_book ? ` @ ${escapeHtml(opp.bet.soft_book)}` : '';
       const point = opp.bet.point !== undefined && opp.bet.point !== null ? ` (${formatLine(opp.bet.point)})` : '';
-      return `<span class="outcome">${exchangeBadge}<strong>${opp.bet.outcome || ''}${point}</strong><span>${book}</span></span>`;
+      return `<span class="outcome">${exchangeBadge}<strong>${escapeHtml(opp.bet.outcome || '')}${point}</strong><span>${book}</span></span>`;
     }
 
     function updateOddsToggle() {
@@ -948,25 +959,25 @@
 
     function formatOutcome(item) {
       if (!item) return '';
-      const point = item.point !== undefined && item.point !== null ? ` (${item.point})` : '';
+      const point = item.point !== undefined && item.point !== null ? ` (${escapeHtml(item.point)})` : '';
       const stake = item.stake !== undefined ? formatCurrency(item.stake) : '';
-      const book = item.bookmaker ? ` @ ${item.bookmaker}` : '';
+      const book = item.bookmaker ? ` @ ${escapeHtml(item.bookmaker)}` : '';
       const exchangeBadge = item.is_exchange ? '<span class="exchange-badge">Exchange</span>' : '';
       const effectiveNote =
         item.is_exchange && item.effective_price && item.effective_price !== item.price
           ? `<span class="mono net-note">Net @ ${formatOddsDisplay(item.effective_price)}</span>`
           : '';
-      return `<span class="outcome">${exchangeBadge}<strong>${item.outcome || ''}${point}</strong><span>${stake}${book}</span><span class="mono">@ ${formatOddsDisplay(item.price)}</span>${effectiveNote}</span>`;
+      return `<span class="outcome">${exchangeBadge}<strong>${escapeHtml(item.outcome || '')}${point}</strong><span>${stake}${book}</span><span class="mono">@ ${formatOddsDisplay(item.price)}</span>${effectiveNote}</span>`;
     }
 
     function formatMarket(opp) {
       if (opp.market === 'spreads' || opp.market === 'totals') {
         const point = opp.best_odds?.[0]?.point ?? opp.point;
         if (point !== undefined && point !== null) {
-          return `${opp.market} (${point})`;
+          return `${escapeHtml(opp.market)} (${escapeHtml(point)})`;
         }
       }
-      return opp.market || '';
+      return escapeHtml(opp.market || '');
     }
 
     function formatPrice(value) {
@@ -986,10 +997,14 @@
       });
       const sumInv = inverses.reduce((a, b) => a + b, 0);
       if (sumInv <= 0) return null;
+      let allocated = 0;
       const breakdown = odds.map((o, idx) => {
         if (!o || !o.price) return null;
         const fraction = inverses[idx] / sumInv;
-        const stake = Number((totalStake * fraction).toFixed(2));
+        const stake = idx === odds.length - 1
+          ? Number((totalStake - allocated).toFixed(2))
+          : Number((totalStake * fraction).toFixed(2));
+        allocated += stake;
         const displayPrice = Number(o.price);
         const effectivePrice = Number(o.effective_price ?? o.price);
         const priceUsed = useEffectivePrices ? effectivePrice : displayPrice;
@@ -1028,7 +1043,7 @@
         const details = data.sport_errors
           .map((err) => `${err.sport || err.sport_key || 'Unknown'} (${err.error || 'Unknown error'})`)
           .join(', ');
-        partialWarning.innerHTML = `<strong>Partial results:</strong> Failed to fetch odds for ${details}.`;
+        partialWarning.innerHTML = `<strong>Partial results:</strong> Failed to fetch odds for ${escapeHtml(details)}.`;
         partialWarning.classList.remove('hidden');
       } else {
         partialWarning.classList.add('hidden');
@@ -1048,7 +1063,7 @@
         ? opp.exchange_books.join(', ')
         : 'Exchange';
       const commissionText = formatCommissionPercent(lastCommissionRate);
-      return `<span class="exchange-flag">${names}<span class="exchange-note">${commissionText}</span></span>`;
+      return `<span class="exchange-flag">${escapeHtml(names)}<span class="exchange-note">${commissionText}</span></span>`;
     }
 
     function setActiveTab(tab) {
@@ -1077,17 +1092,17 @@
         range = integers.length === 1 ? `${integers[0]}` : `${integers[0]}-${integers[integers.length - 1]}`;
       }
       const pieces = [range, points].filter(Boolean);
-      return `${pieces.join(' · ')}${keyFlag}`;
+      return `${escapeHtml(pieces.join(' · '))}${keyFlag}`;
     }
 
     function formatMiddleSide(side, stakeValue) {
       if (!side) return '';
       const line = side.line !== undefined && side.line !== null ? formatLine(side.line) : '';
-      const book = side.bookmaker ? ` @ ${side.bookmaker}` : '';
+      const book = side.bookmaker ? ` @ ${escapeHtml(side.bookmaker)}` : '';
       const odds = side.effective_price ? formatOddsDisplay(side.effective_price) : formatOddsDisplay(side.price);
       const stake = stakeValue ? `Stake: ${formatCurrency(stakeValue)}` : '';
       const exchangeBadge = side.is_exchange ? '<span class="exchange-badge">Exchange</span>' : '';
-      return `<span class="outcome">${exchangeBadge}<strong>${side.team || ''} ${line}</strong><span>Odds: ${odds}${book}</span><span>${stake}</span></span>`;
+      return `<span class="outcome">${exchangeBadge}<strong>${escapeHtml(side.team || '')} ${line}</strong><span>Odds: ${odds}${book}</span><span>${stake}</span></span>`;
     }
 
     function formatLine(value) {
@@ -1116,11 +1131,11 @@
           const bandClass = type === 'roi' ? roiBandLabelClass(label) : '';
           return `
             <div class="bar-row">
-              <span>${label}</span>
+              <span>${escapeHtml(label)}</span>
               <div class="bar-track">
                 <div class="bar-fill ${bandClass}" style="width: ${width}%"></div>
               </div>
-              <span class="bar-value">${value}</span>
+              <span class="bar-value">${escapeHtml(value)}</span>
             </div>`;
         })
         .join('');

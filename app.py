@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import re
 import socket
 import threading
 import webbrowser
@@ -21,6 +23,7 @@ from config import (
     KELLY_OPTIONS,
     MIN_EDGE_PERCENT,
     REGION_OPTIONS,
+    REGION_CONFIG,
     SHARP_BOOKS,
 )
 from scanner import run_scan
@@ -28,6 +31,8 @@ from scanner import run_scan
 load_dotenv()
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+app.config["TRUSTED_HOSTS"] = ["localhost", "127.0.0.1", "[::1]"]
 ENV_API_KEY = os.getenv("ODDS_API_KEY") or os.getenv("THEODDSAPI_API_KEY")
 
 
@@ -50,50 +55,50 @@ def index() -> str:
 
 @app.route("/scan", methods=["POST"])
 def scan() -> tuple:
-    payload = request.get_json(force=True, silent=True) or {}
-    api_key = ENV_API_KEY or (payload.get("apiKey") or "").strip()
-    sports = payload.get("sports") or []
-    all_sports = bool(payload.get("allSports"))
-    stake = payload.get("stake")
-    regions = payload.get("regions")
-    commission = payload.get("commission")
-    sharp_book = (payload.get("sharpBook") or DEFAULT_SHARP_BOOK).strip().lower()
+    if not request.is_json:
+        return jsonify(success=False, error="Content-Type must be application/json"), 415
+    if request.headers.get("Sec-Fetch-Site") == "cross-site" or (
+        request.origin and request.origin != request.host_url.rstrip("/")
+    ):
+        return jsonify(success=False, error="Cross-origin scans are not allowed"), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(success=False, error="Expected a JSON object"), 400
     try:
-        min_edge_percent = (
-            float(payload.get("minEdgePercent")) if payload.get("minEdgePercent") is not None else MIN_EDGE_PERCENT
-        )
-    except (TypeError, ValueError):
-        min_edge_percent = MIN_EDGE_PERCENT
-    min_edge_percent = max(0.0, min_edge_percent)
-    try:
-        bankroll_value = float(payload.get("bankroll")) if payload.get("bankroll") is not None else DEFAULT_BANKROLL
-    except (TypeError, ValueError):
-        bankroll_value = DEFAULT_BANKROLL
-    bankroll_value = max(0.0, bankroll_value)
-    try:
-        kelly_fraction = (
-            float(payload.get("kellyFraction"))
-            if payload.get("kellyFraction") is not None
-            else DEFAULT_KELLY_FRACTION
-        )
-    except (TypeError, ValueError):
-        kelly_fraction = DEFAULT_KELLY_FRACTION
-    kelly_fraction = max(0.0, min(kelly_fraction, 1.0))
-    try:
-        stake_value = float(stake) if stake is not None else 100.0
-    except (TypeError, ValueError):
-        stake_value = 100.0
-    if isinstance(regions, list):
-        regions_value = [str(region) for region in regions if isinstance(region, str)]
-    else:
-        regions_value = None
-    try:
-        commission_percent = float(commission) if commission is not None else None
-    except (TypeError, ValueError):
-        commission_percent = None
-    commission_rate = (
-        commission_percent / 100.0 if commission_percent is not None else DEFAULT_COMMISSION
-    )
+        api_key = ENV_API_KEY or payload.get("apiKey", "")
+        if not isinstance(api_key, str):
+            raise ValueError("apiKey must be a string")
+        api_key = api_key.strip()
+        sports = payload.get("sports", [])
+        if not isinstance(sports, list) or any(
+            not isinstance(sport, str) or not re.fullmatch(r"[a-z0-9_]+", sport) for sport in sports
+        ):
+            raise ValueError("sports must be a list of sport keys")
+        all_sports = payload.get("allSports", False)
+        if not isinstance(all_sports, bool):
+            raise ValueError("allSports must be a boolean")
+        regions_value = payload.get("regions", DEFAULT_REGION_KEYS)
+        if (
+            not isinstance(regions_value, list)
+            or not regions_value
+            or any(
+                not isinstance(region, str) or region not in REGION_CONFIG
+                for region in regions_value
+            )
+        ):
+            raise ValueError("regions must be a non-empty list of supported regions")
+        sharp_book = payload.get("sharpBook", DEFAULT_SHARP_BOOK)
+        if not isinstance(sharp_book, str) or sharp_book not in {b["key"] for b in SHARP_BOOKS}:
+            raise ValueError("Unsupported sharpBook")
+        stake_value = _number(payload, "stake", 100.0, 0.01, 1e9)
+        if not math.isclose(stake_value, round(stake_value, 2), abs_tol=1e-8):
+            raise ValueError("stake must have at most two decimal places")
+        commission_rate = _number(payload, "commission", DEFAULT_COMMISSION * 100, 0, 20) / 100
+        min_edge_percent = _number(payload, "minEdgePercent", MIN_EDGE_PERCENT, 0, 100)
+        bankroll_value = _number(payload, "bankroll", DEFAULT_BANKROLL, 0, 1e9)
+        kelly_fraction = _number(payload, "kellyFraction", DEFAULT_KELLY_FRACTION, 0, 1)
+    except ValueError as exc:
+        return jsonify(success=False, error=str(exc)), 400
     result = run_scan(
         api_key,
         sports,
@@ -108,6 +113,25 @@ def scan() -> tuple:
     )
     status = 200 if result.get("success") else result.get("error_code", 500)
     return jsonify(result), status
+
+
+def _number(payload: dict, key: str, default: float, lower: float, upper: float) -> float:
+    value = payload.get(key, default)
+    try:
+        number = float(value)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError(f"{key} must be a finite number") from None
+    if isinstance(value, bool) or not math.isfinite(number) or not lower <= number <= upper:
+        raise ValueError(f"{key} must be between {lower} and {upper}")
+    return number
+
+
+@app.after_request
+def response_headers(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 
 def _port_available(port: int) -> bool:
